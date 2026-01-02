@@ -269,6 +269,16 @@ export async function getPagesByStatuses(
  * Returns pages with status='processing' that have markdown_content but no gemini_file_id
  * Optionally filter by process_job_id (ingestion or sync job)
  */
+/**
+ * Get pages that are ready for indexing
+ * 
+ * Criteria:
+ * - status = 'ready_for_indexing' (set by ingestion/sync after scraping)
+ * - markdown_content is not null (content has been scraped)
+ * - gemini_file_id is null (not yet indexed in Gemini)
+ * 
+ * These are pages that have been scraped by ingestion/sync and are waiting to be indexed.
+ */
 export async function getPagesReadyForIndexing(
   websiteId: string,
   options?: {
@@ -280,10 +290,10 @@ export async function getPagesReadyForIndexing(
     .from('pages')
     .select()
     .eq('website_id', websiteId)
-    .eq('status', 'processing')
-    .not('markdown_content', 'is', null)
-    .or('gemini_file_id.is.null,gemini_file_id.eq.')
-    .order('updated_at', { ascending: true }); // Oldest first
+    .eq('status', 'ready_for_indexing') // Pages marked as ready for indexing by ingestion/sync
+    .not('markdown_content', 'is', null) // Must have scraped content
+    .or('gemini_file_id.is.null,gemini_file_id.eq.') // Not yet indexed (no gemini_file_id)
+    .order('updated_at', { ascending: true }); // Oldest first (FIFO)
 
   // Optional: Filter by process job (ingestion or sync)
   // Check if page was created/updated by this process job

@@ -17,12 +17,12 @@ const log = loggers.mcp;
 
 export const SiteAskSchema = z.object({
   question: z.string().describe('The question to ask about the website content'),
-  websiteId: z.string().optional().describe('Optional: specific website ID to query'),
+  websiteDomain: z.string().describe('Website domain (e.g., "example.com" or "https://www.example.com")'),
 });
 
 export const SiteCheckSchema = z.object({
   query: z.string().describe('Topic or draft title to check for existing content'),
-  websiteId: z.string().optional().describe('Optional: specific website ID to check'),
+  websiteDomain: z.string().describe('Website domain (e.g., "example.com" or "https://www.example.com")'),
 });
 
 export const SiteStatusSchema = z.object({
@@ -46,7 +46,7 @@ export const SiteListSchema = z.object({});
 
 export const SiteSearchSchema = z.object({
   keywords: z.array(z.string()).describe('Keywords to search for'),
-  websiteId: z.string().optional().describe('Optional: specific website ID'),
+  websiteDomain: z.string().describe('Website domain (e.g., "example.com" or "https://www.example.com")'),
 });
 
 // ============================================================================
@@ -65,12 +65,12 @@ export const toolDefinitions = [
           type: 'string',
           description: 'The question to ask about the website content',
         },
-        websiteId: {
+        websiteDomain: {
           type: 'string',
-          description: 'Optional: specific website ID to query. Uses first website if not specified.',
+          description: 'Website domain (e.g., "example.com" or "https://www.example.com"). Can be a full URL or just the domain.',
         },
       },
-      required: ['question'],
+      required: ['question', 'websiteDomain'],
     },
   },
   {
@@ -84,12 +84,12 @@ export const toolDefinitions = [
           type: 'string',
           description: 'Topic or draft title to check for existing content',
         },
-        websiteId: {
+        websiteDomain: {
           type: 'string',
-          description: 'Optional: specific website ID to check',
+          description: 'Website domain (e.g., "example.com" or "https://www.example.com")',
         },
       },
-      required: ['query'],
+      required: ['query', 'websiteDomain'],
     },
   },
   {
@@ -177,12 +177,12 @@ export const toolDefinitions = [
           items: { type: 'string' },
           description: 'Keywords to search for',
         },
-        websiteId: {
+        websiteDomain: {
           type: 'string',
-          description: 'Optional: specific website ID',
+          description: 'Website domain (e.g., "example.com" or "https://www.example.com")',
         },
       },
-      required: ['keywords'],
+      required: ['keywords', 'websiteDomain'],
     },
   },
 ];
@@ -203,7 +203,7 @@ export async function handleToolCall(
     switch (name) {
       case 'site_ask': {
         const parsed = SiteAskSchema.parse(args);
-        const response = await search.askQuestion(parsed.question, parsed.websiteId);
+        const response = await search.askQuestion(parsed.question, parsed.websiteDomain);
         result = {
           answer: response.answer,
           sources: response.sources,
@@ -214,7 +214,7 @@ export async function handleToolCall(
 
       case 'site_check_existing_content': {
         const parsed = SiteCheckSchema.parse(args);
-        const response = await search.checkExistingContent(parsed.query, parsed.websiteId);
+        const response = await search.checkExistingContent(parsed.query, parsed.websiteDomain);
         result = {
           hasExistingContent: response.hasExistingContent,
           answer: response.answer,
@@ -271,7 +271,7 @@ export async function handleToolCall(
 
       case 'site_find_mentions': {
         const parsed = SiteSearchSchema.parse(args);
-        const response = await search.findMentions(parsed.keywords, parsed.websiteId);
+        const response = await search.findMentions(parsed.keywords, parsed.websiteDomain);
         result = {
           answer: response.answer,
           pages: response.pages,

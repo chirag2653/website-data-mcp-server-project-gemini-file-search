@@ -10,7 +10,9 @@
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts",
-    "test": "vitest"
+    "test": "vitest",
+    "cleanup": "tsx scripts/cleanup-gemini.ts",
+    "cleanup:docs": "tsx scripts/cleanup-gemini.ts --docs-only"
   },
   "keywords": [
     "mcp",

@@ -6,6 +6,8 @@
 import * as supabase from '../clients/supabase.js';
 import * as gemini from '../clients/gemini.js';
 import { loggers } from '../utils/logger.js';
+import { normalizeDomain, extractBaseDomain } from '../utils/url.js';
+import { validateSearchInput } from './search-validation.js';
 import type { SearchResult } from '../types/index.js';
 
 const log = loggers.search;
@@ -15,34 +17,77 @@ const log = loggers.search;
  *
  * This is the main search function that uses Gemini File Search
  * to find relevant content and generate a grounded answer.
+ * 
+ * @param question - The question to ask about the website content
+ * @param websiteDomain - The website domain (can be URL, domain, or domain with extra text)
+ *                        Examples: "example.com", "https://www.example.com", "www.example.com/path"
+ * @returns Search result with answer and sources
  */
 export async function askQuestion(
   question: string,
-  websiteId?: string
+  websiteDomain: string
 ): Promise<SearchResult> {
-  log.info({ question: question.slice(0, 100), websiteId }, 'Processing question');
+  // ========================================================================
+  // STEP 1: INPUT VALIDATION (Production-grade validation with Zod)
+  // ========================================================================
+  try {
+    const validated = validateSearchInput(question, websiteDomain);
+    question = validated.question;
+    websiteDomain = validated.websiteDomain;
+  } catch (validationError) {
+    const message = validationError instanceof Error ? validationError.message : 'Invalid input';
+    log.error({ question, websiteDomain, error: message }, 'Input validation failed');
+    throw new Error(`Invalid search input: ${message}`);
+  }
 
-  // Get website (use first if not specified)
-  let website;
-  if (websiteId) {
-    website = await supabase.getWebsiteById(websiteId);
-    if (!website) {
-      throw new Error(`Website not found: ${websiteId}`);
-    }
-  } else {
-    const websites = await supabase.getAllWebsites();
-    if (websites.length === 0) {
-      throw new Error('No websites indexed. Please ingest a website first.');
-    }
-    website = websites[0];
-    log.info({ websiteId: website.id, domain: website.domain }, 'Using default website');
+  // ========================================================================
+  // STEP 2: NORMALIZE DOMAIN (Extract clean domain from input)
+  // ========================================================================
+  // Extract domain from URL/string, then get base domain (removes www)
+  // This matches ingestion logic: www.example.com and example.com resolve to same website
+  const extractedDomain = normalizeDomain(websiteDomain);
+  const baseDomain = extractBaseDomain(extractedDomain);
+  
+  log.info({ 
+    originalDomain: websiteDomain, 
+    extractedDomain,
+    baseDomain,
+    question: question.slice(0, 100) 
+  }, 'Processing question');
+
+  // ========================================================================
+  // STEP 3: LOOKUP WEBSITE BY BASE DOMAIN
+  // ========================================================================
+  // Use base domain lookup (same as ingestion) to handle www vs non-www
+  const website = await supabase.getWebsiteByDomain(baseDomain);
+  
+  if (!website) {
+    throw new Error(
+      `Website not found for domain: ${baseDomain}. ` +
+      `The domain "${websiteDomain}" has not been indexed yet. ` +
+      `Would you like to index it? Please run ingestion first.`
+    );
   }
 
   if (!website.gemini_store_id) {
-    throw new Error('Website has no Gemini File Search store');
+    throw new Error(
+      `Website "${baseDomain}" has no Gemini File Search store. ` +
+      `Please run indexing to create the store.`
+    );
   }
 
-  // Execute search
+  log.info(
+    { 
+      websiteId: website.id, 
+      domain: website.domain,
+      storeId: website.gemini_store_id 
+    },
+    'Website found, executing search'
+  );
+
+  // ========================================================================
+  // STEP 4: EXECUTE SEARCH
+  // ========================================================================
   const response = await gemini.searchWithFileSearch(
     website.gemini_store_id,
     question
@@ -56,7 +101,11 @@ export async function askQuestion(
   }));
 
   log.info(
-    { websiteId: website.id, sourceCount: sources.length },
+    { 
+      websiteId: website.id, 
+      domain: website.domain,
+      sourceCount: sources.length 
+    },
     'Question answered'
   );
 
@@ -75,14 +124,14 @@ export async function askQuestion(
  */
 export async function checkExistingContent(
   query: string,
-  websiteId?: string
+  websiteDomain: string
 ): Promise<{
   hasExistingContent: boolean;
   answer: string;
   relevantPages: Array<{ url: string; title: string }>;
   websiteId: string;
 }> {
-  log.info({ query: query.slice(0, 100), websiteId }, 'Checking existing content');
+  log.info({ query: query.slice(0, 100), websiteDomain }, 'Checking existing content');
 
   const prompt = `Based on the indexed website content, answer this question:
 
@@ -99,7 +148,7 @@ If no:
 
 Be specific and cite the actual pages from the website.`;
 
-  const result = await askQuestion(prompt, websiteId);
+  const result = await askQuestion(prompt, websiteDomain);
 
   // Determine if content exists based on response
   const lowerAnswer = result.answer.toLowerCase();
@@ -123,35 +172,34 @@ export async function searchWithFilter(
   question: string,
   filter: {
     pathPrefix?: string;
-    websiteId?: string;
+    websiteDomain: string;
   }
 ): Promise<SearchResult> {
   log.info({ question: question.slice(0, 100), filter }, 'Filtered search');
+
+  // Normalize domain to base domain (same as ingestion)
+  const extractedDomain = normalizeDomain(filter.websiteDomain);
+  const baseDomain = extractBaseDomain(extractedDomain);
+
+  // Get website by base domain
+  const website = await supabase.getWebsiteByDomain(baseDomain);
+  if (!website) {
+    throw new Error(
+      `Website not found for domain: ${baseDomain}. ` +
+      `The domain "${filter.websiteDomain}" has not been indexed yet. ` +
+      `Would you like to index it? Please run ingestion first.`
+    );
+  }
+
+  if (!website.gemini_store_id) {
+    throw new Error('Website has no Gemini File Search store');
+  }
 
   // Build metadata filter if path prefix provided
   let metadataFilter: string | undefined;
   if (filter.pathPrefix) {
     // Use Gemini's metadata filter syntax
     metadataFilter = `path LIKE "${filter.pathPrefix}%"`;
-  }
-
-  // Get website
-  let website;
-  if (filter.websiteId) {
-    website = await supabase.getWebsiteById(filter.websiteId);
-    if (!website) {
-      throw new Error(`Website not found: ${filter.websiteId}`);
-    }
-  } else {
-    const websites = await supabase.getAllWebsites();
-    if (websites.length === 0) {
-      throw new Error('No websites indexed');
-    }
-    website = websites[0];
-  }
-
-  if (!website.gemini_store_id) {
-    throw new Error('Website has no Gemini File Search store');
   }
 
   // Execute filtered search
@@ -176,7 +224,7 @@ export async function searchWithFilter(
  */
 export async function summarizeTopic(
   topic: string,
-  websiteId?: string
+  websiteDomain: string
 ): Promise<{
   summary: string;
   sources: Array<{ url: string; title: string }>;
@@ -192,7 +240,7 @@ Include:
 
 Base your summary only on the actual website content. Cite the specific pages used.`;
 
-  const result = await askQuestion(prompt, websiteId);
+  const result = await askQuestion(prompt, websiteDomain);
 
   return {
     summary: result.answer,
@@ -206,7 +254,7 @@ Base your summary only on the actual website content. Cite the specific pages us
  */
 export async function findMentions(
   keywords: string[],
-  websiteId?: string
+  websiteDomain: string
 ): Promise<{
   answer: string;
   pages: Array<{ url: string; title: string }>;
@@ -223,7 +271,7 @@ For each page found:
 
 If no pages mention these keywords, say so clearly.`;
 
-  const result = await askQuestion(prompt, websiteId);
+  const result = await askQuestion(prompt, websiteDomain);
 
   return {
     answer: result.answer,
@@ -231,3 +279,4 @@ If no pages mention these keywords, say so clearly.`;
     websiteId: result.websiteId,
   };
 }
+

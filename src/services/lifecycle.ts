@@ -115,9 +115,9 @@ export async function reindexUrl(url: string): Promise<ReindexResult> {
   // Content changed - delete old file and upload new one
   log.info({ url: normalizedUrl }, 'Content changed, re-uploading');
 
-  // Phase 1: DB Draft - Save new markdown and hash, set status to 'processing'
+  // Phase 1: DB Draft - Save new markdown and hash, set status to 'ready_for_indexing'
   await supabase.updatePage(page.id, {
-    status: 'processing',
+    status: 'ready_for_indexing', // New content scraped, ready for indexing service
     title: scrapeResult.data.metadata.title,
     content_hash: newHash,
     markdown_content: content,

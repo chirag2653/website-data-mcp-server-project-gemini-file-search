@@ -6,8 +6,8 @@
 
 import * as ingestion from './dist/services/ingestion.js';
 
-const websiteUrl = 'https://tilakmandirwala.com/';
-const displayName = 'Tilak Mandirwala - Custom Marble Temples';
+const websiteUrl = 'https://smartscalemarketing.com/';
+const displayName = 'Smart Scale Marketing - AI Marketing Automation Agency';
 
 console.log('🚀 Starting Website Ingestion Test\n');
 console.log('='.repeat(60));

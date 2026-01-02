@@ -128,12 +128,12 @@ export async function syncWebsite(websiteId: string): Promise<SyncResult> {
                 continue;
               }
 
-              // Write complete scrape to DB with status='processing'
+              // Write complete scrape to DB with status='ready_for_indexing'
               try {
                 const contentHash = computeContentHash(pageData.markdown);
                 
                 await supabase.updatePage(page.id, {
-                  status: 'processing',
+                  status: 'ready_for_indexing', // Page scraped, markdown stored, ready for indexing service to pick up
                   content_hash: contentHash,
                   markdown_content: pageData.markdown,
                   title: pageData.metadata.title,
@@ -500,13 +500,14 @@ export async function syncWebsite(websiteId: string): Promise<SyncResult> {
     );
 
     // Step 9: Trigger indexing pipeline (separate process - fire and forget)
-    // This will pick up pages with status='processing' and upload to Gemini
+    // This will pick up pages with status='ready_for_indexing' and upload to Gemini
     // We don't await this - sync completes independently, indexing runs in background
     log.info({ websiteId, syncJobId: syncJob.id }, 'Triggering indexing pipeline (async)');
     
     // Fire and forget - indexing runs independently
+    // Pass syncJobId (not ingestionJobId) for clear lineage tracking
     indexingService.indexWebsite(websiteId, {
-      ingestionJobId: syncJob.id, // Pass sync job ID (indexing can filter by it)
+      syncJobId: syncJob.id, // Pass sync job ID for correct lineage
     }).then((indexingResult) => {
       log.info(
         {

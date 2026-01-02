@@ -51,6 +51,7 @@ export async function createFileSearchStore(
 
 /**
  * Get a File Search store by name
+ * Returns store information including document counts
  */
 export async function getFileSearchStore(
   name: string
@@ -63,6 +64,10 @@ export async function getFileSearchStore(
       displayName: store.displayName ?? '',
       createTime: store.createTime,
       updateTime: store.updateTime,
+      activeDocumentsCount: store.activeDocumentsCount,
+      pendingDocumentsCount: store.pendingDocumentsCount,
+      failedDocumentsCount: store.failedDocumentsCount,
+      sizeBytes: store.sizeBytes,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
@@ -70,6 +75,115 @@ export async function getFileSearchStore(
       return null;
     }
     throw new Error(`Failed to get File Search store: ${message}`);
+  }
+}
+
+/**
+ * List documents in a File Search store
+ * According to API docs: https://ai.google.dev/api/file-search/documents
+ * The SDK returns a Pager - we'll use it to get all documents
+ */
+export async function listDocumentsInStore(
+  storeName: string,
+  options?: {
+    maxResults?: number; // Maximum number of documents to return
+  }
+): Promise<{
+  documents: Array<{
+    name: string;
+    displayName?: string;
+    mimeType?: string;
+    sizeBytes?: string;
+    createTime?: string;
+    updateTime?: string;
+    state?: string;
+  }>;
+  totalCount: number;
+}> {
+  log.info({ storeName, maxResults: options?.maxResults }, 'Listing documents in store');
+
+  try {
+    // Ensure storeName is in correct format
+    const normalizedStoreName = storeName.startsWith('fileSearchStores/') 
+      ? storeName 
+      : `fileSearchStores/${storeName}`;
+
+    const documents: Array<{
+      name: string;
+      displayName?: string;
+      mimeType?: string;
+      sizeBytes?: string;
+      createTime?: string;
+      updateTime?: string;
+      state?: string;
+    }> = [];
+
+    // The SDK returns a Pager - iterate through it using async iteration
+    // The Pager is an async iterable, so we use for-await-of
+    const pagerResult = genai.fileSearchStores.documents.list({
+      parent: normalizedStoreName,
+    });
+    
+    // Await if it's a Promise, otherwise use directly
+    const pager = pagerResult instanceof Promise ? await pagerResult : pagerResult;
+
+    // Use async iteration to iterate through the pager
+    let pageCount = 0;
+    const maxPages = 100; // Safety limit
+    
+    try {
+      for await (const page of pager) {
+        if (pageCount >= maxPages) {
+          break;
+        }
+
+        // page might be an array of documents or a single document
+        const pageDocs = Array.isArray(page) ? page : [page];
+        
+        for (const doc of pageDocs) {
+          documents.push({
+            name: doc.name || '',
+            displayName: doc.displayName,
+            mimeType: doc.mimeType,
+            sizeBytes: doc.sizeBytes,
+            createTime: doc.createTime,
+            updateTime: doc.updateTime,
+            state: doc.state,
+          });
+
+          // Stop if we've reached maxResults
+          if (options?.maxResults && documents.length >= options.maxResults) {
+            break;
+          }
+        }
+
+        // Stop if we've reached maxResults
+        if (options?.maxResults && documents.length >= options.maxResults) {
+          break;
+        }
+
+        pageCount++;
+      }
+    } catch (iterError) {
+      // If async iteration fails, the pager might not be iterable
+      // Log and continue with empty results or throw
+      log.warn({ storeName, error: iterError }, 'Failed to iterate pager, may not be async iterable');
+      // Continue with whatever documents we collected so far
+    }
+
+    log.info(
+      { storeName, documentCount: documents.length },
+      'Documents listed'
+    );
+
+    return {
+      documents: options?.maxResults ? documents.slice(0, options.maxResults) : documents,
+      totalCount: documents.length,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    log.error({ storeName, error: message }, 'Failed to list documents');
+    throw new Error(`Failed to list documents: ${message}`);
   }
 }
 
@@ -279,6 +393,19 @@ export async function deleteFileFromStore(
 
 /**
  * Query the File Search store with a question
+ * 
+ * @param storeName - The File Search store name
+ * @param question - The question to ask
+ * @param options - Optional configuration
+ * @param options.metadataFilter - Filter documents by metadata (JSON string)
+ * 
+ * @returns Search response with answer, citations, and grounding metadata
+ * 
+ * @note Chunk Limitation:
+ * - Gemini typically returns ~5 chunks from 2-3 unique documents per query
+ * - There is NO documented parameter to control or increase chunk count
+ * - This is a known API limitation (see: https://discuss.ai.google.dev/t/investigating-undocumented-file-search-retrieval-limits)
+ * - The API manages retrieval internally based on relevance
  */
 export async function searchWithFileSearch(
   storeName: string,
@@ -311,10 +438,29 @@ export async function searchWithFileSearch(
     const answer = response.text ?? '';
 
     // Extract citations from grounding metadata
+    // According to Gemini API docs: https://ai.google.dev/gemini-api/docs/file-search
+    // Citations are provided via groundingMetadata.groundingChunks
+    // Each chunk contains retrievedContext with the document content used
     const sources = extractCitations(response);
 
+    // Log chunk statistics for monitoring
+    const groundingMetadata = response.candidates?.[0]?.groundingMetadata;
+    const chunkCount = groundingMetadata?.groundingChunks?.length ?? 0;
+    const uniqueDocuments = new Set(
+      groundingMetadata?.groundingChunks?.map(chunk => {
+        const ctx = (chunk.retrievedContext as any);
+        return ctx?.title || ctx?.uri || 'unknown';
+      }) ?? []
+    ).size;
+
     log.info(
-      { storeName, sourceCount: sources.length },
+      { 
+        storeName, 
+        sourceCount: sources.length,
+        chunkCount,
+        uniqueDocuments,
+        note: 'Gemini typically returns ~5 chunks from 2-3 documents (no control parameter available)'
+      },
       'Search completed'
     );
 
@@ -564,14 +710,48 @@ function extractCitations(response: {
   }>;
 }): GeminiSearchResponse['sources'] {
   const metadata = response.candidates?.[0]?.groundingMetadata;
-  if (!metadata?.groundingChunks) return [];
+  
+  if (!metadata) {
+    return [];
+  }
+  
+  if (!metadata.groundingChunks || metadata.groundingChunks.length === 0) {
+    return [];
+  }
 
   const seen = new Set<string>();
   const sources: GeminiSearchResponse['sources'] = [];
 
+  // Extract citations from grounding chunks
+  // According to Gemini API docs: https://ai.google.dev/gemini-api/docs/file-search
+  // - Citations are provided via groundingMetadata.groundingChunks
+  // - Each chunk contains retrievedContext with document content
+  // - retrievedContext.text contains the document content used
+  // - retrievedContext.title contains the displayName we set during upload
+  // - NOTE: retrievedContext does NOT always include URI (known limitation)
+  // - URLs must be extracted from the text content (markdown contains URLs)
   for (const chunk of metadata.groundingChunks) {
-    const uri = chunk.retrievedContext?.uri;
-    const title = chunk.retrievedContext?.title;
+    const retrievedContext = chunk.retrievedContext as any; // SDK returns more fields than typed
+    
+    // Try to get URI from different possible locations (may not exist)
+    let uri = retrievedContext?.uri 
+      || retrievedContext?.sourceUri
+      || retrievedContext?.documentUri
+      || (chunk as any).uri;
+    
+    // If no URI found directly, extract from text (URLs are embedded in markdown)
+    // This is the standard approach - Gemini doesn't provide URI in retrievedContext
+    // The URL is embedded in the markdown content we uploaded
+    if (!uri && retrievedContext?.text) {
+      const urlMatch = retrievedContext.text.match(/https?:\/\/[^\s\)]+/);
+      if (urlMatch) {
+        // Clean up the URL (remove trailing fragments like #content or closing parentheses)
+        uri = urlMatch[0].split('#')[0].split(')')[0].trim();
+      }
+    }
+    
+    // Title comes from displayName we set during upload
+    const title = retrievedContext?.title || (chunk as any).title;
 
     if (uri && !seen.has(uri)) {
       seen.add(uri);

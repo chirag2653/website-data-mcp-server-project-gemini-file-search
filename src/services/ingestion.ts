@@ -9,7 +9,7 @@ import * as gemini from '../clients/gemini.js';
 import * as syncService from './sync.js';
 import * as indexingService from './indexing.js';
 import { computeContentHash } from '../utils/hash.js';
-import { extractDomain, extractPath, normalizeUrl, filterUrlsByDomain } from '../utils/url.js';
+import { extractDomain, extractBaseDomain, extractPath, normalizeUrl, filterUrlsByDomain } from '../utils/url.js';
 import { loggers } from '../utils/logger.js';
 import { validateIngestionInput } from './ingestion-validation.js';
 import type {
@@ -28,7 +28,7 @@ const log = loggers.ingestion;
  * 2. Create website record in Supabase
  * 3. Discover all URLs via FireCrawl /map
  * 4. Batch scrape all URLs
- * 5. Write only complete scrapes to DB (status='processing')
+ * 5. Write only complete scrapes to DB (status='ready_for_indexing')
  * 6. Discard incomplete scrapes (never write to DB)
  * 7. Trigger indexing pipeline to upload to Gemini
  */
@@ -55,15 +55,16 @@ export async function checkWebsiteExists(seedUrl: string): Promise<{
   action: 'sync' | 'ingest';
 }> {
   const normalizedSeedUrl = normalizeUrl(seedUrl);
-  const domain = extractDomain(normalizedSeedUrl);
+  const extractedDomain = extractDomain(normalizedSeedUrl);
+  const baseDomain = extractBaseDomain(extractedDomain); // Check by base domain
   
-  // Check by exact domain (each domain/subdomain is separate)
-  const existingWebsite = await supabase.getWebsiteByDomain(domain);
+  // Check by base domain so www and non-www resolve to same website
+  const existingWebsite = await supabase.getWebsiteByDomain(baseDomain);
   
   return {
     exists: !!existingWebsite,
     website: existingWebsite,
-    domain,
+    domain: baseDomain,
     action: existingWebsite ? 'sync' : 'ingest',
   };
 }
@@ -85,28 +86,30 @@ export async function ingestWebsite(
     throw new Error(`Invalid ingestion input: ${message}`);
   }
 
-  // Normalize and extract domain after validation
+  // Normalize and extract base domain after validation
+  // Store base domain (without www) in Supabase for consistency
   const normalizedSeedUrl = normalizeUrl(seedUrl);
-  const domain = extractDomain(normalizedSeedUrl);
-  const siteName = displayName ?? domain;
+  const extractedDomain = extractDomain(normalizedSeedUrl);
+  const baseDomain = extractBaseDomain(extractedDomain); // Remove www for storage
+  const siteName = displayName ?? baseDomain;
   const errors: SyncError[] = [];
 
-  log.info({ seedUrl: normalizedSeedUrl, domain }, 'Starting website ingestion');
+  log.info({ seedUrl: normalizedSeedUrl, extractedDomain, baseDomain }, 'Starting website ingestion');
 
   // ========================================================================
-  // STEP 1: CHECK IF WEBSITE ALREADY EXISTS (by exact domain)
+  // STEP 1: CHECK IF WEBSITE ALREADY EXISTS (by base domain)
   // ========================================================================
-  // Each domain/subdomain is treated as a separate website
-  const existingWebsite = await supabase.getWebsiteByDomain(domain);
+  // Check by base domain so www and non-www resolve to same website
+  const existingWebsite = await supabase.getWebsiteByDomain(baseDomain);
   if (existingWebsite) {
     log.info(
       { 
-        domain,
+        baseDomain,
         websiteId: existingWebsite.id,
         existingDisplayName: existingWebsite.display_name,
         existingDomain: existingWebsite.domain
       },
-      'Website already exists (exact domain match), automatically switching to sync'
+      'Website already exists (base domain match), automatically switching to sync'
     );
     
     // Automatically run sync instead of failing
@@ -129,18 +132,18 @@ export async function ingestWebsite(
   // ========================================================================
 
   // 2a. Create Gemini File Search store (during website registration)
-  // Each domain/subdomain gets its own store
-  log.info({ domain }, 'Creating Gemini File Search store');
-  const storeName = `website-${domain.replace(/\./g, '-')}-${Date.now()}`;
+  log.info({ baseDomain }, 'Creating Gemini File Search store');
+  const storeName = `website-${baseDomain.replace(/\./g, '-')}-${Date.now()}`;
   const geminiStore = await gemini.createFileSearchStore(storeName);
 
   // 2b. Create website record in Supabase with store ID
   // Store is created BEFORE website record to ensure it exists
   // This is the ONLY place where new websites are registered
-  log.info({ domain, storeId: geminiStore.name }, 'Creating website record with store');
+  // Store base domain (without www) for consistency
+  log.info({ baseDomain, storeId: geminiStore.name }, 'Creating website record with store');
   const website = await supabase.createWebsite({
     seed_url: normalizedSeedUrl,
-    domain: domain, // Store exact domain (each domain/subdomain is separate)
+    domain: baseDomain, // Store base domain (www removed) so www and non-www resolve to same website
     display_name: siteName,
     gemini_store_id: geminiStore.name,
     gemini_store_name: geminiStore.displayName,
@@ -167,13 +170,34 @@ export async function ingestWebsite(
       throw new Error(`Failed to map website: ${mapResult.error}`);
     }
 
-    // Filter to only include same-domain URLs (exact match only)
-    // Each domain/subdomain is separate - only get pages from this exact domain
+    log.info(
+      { 
+        totalLinks: mapResult.links.length, 
+        baseDomain, 
+        sampleLinks: mapResult.links.slice(0, 5) 
+      },
+      'FireCrawl mapping result'
+    );
+
+    // Filter to only include URLs from the base domain
+    // This accepts both www and non-www versions since we store base domain
+    const filteredUrls = filterUrlsByDomain(mapResult.links, baseDomain);
+    
+    log.info(
+      { 
+        beforeFilter: mapResult.links.length, 
+        afterFilter: filteredUrls.length,
+        baseDomain,
+        sampleFiltered: filteredUrls.slice(0, 5)
+      },
+      'URL filtering result'
+    );
+
     const discoveredUrls = [...new Set(
-      filterUrlsByDomain(mapResult.links, domain).map(normalizeUrl)
+      filteredUrls.map(normalizeUrl)
     )];
 
-    log.info({ urlCount: discoveredUrls.length }, 'URLs discovered');
+    log.info({ urlCount: discoveredUrls.length, baseDomain }, 'URLs discovered after normalization');
 
     if (discoveredUrls.length === 0) {
       throw new Error('No URLs discovered during mapping');
@@ -262,7 +286,7 @@ export async function ingestWebsite(
           url,
           path,
           title: pageData.metadata?.title,
-          status: 'processing', // Not 'active' yet - indexing will promote it
+          status: 'ready_for_indexing', // Page scraped, markdown stored, ready for indexing service to pick up
           content_hash: contentHash,
           markdown_content: pageData.markdown, // Complete markdown content
           http_status_code: httpStatusCode,
@@ -305,7 +329,7 @@ export async function ingestWebsite(
     await supabase.updateProcessJob(ingestionJob.id, {
       completed_at: now,
       urls_discovered: discoveredUrls.length,
-      urls_updated: pagesWritten, // Pages written to DB (status='processing')
+      urls_updated: pagesWritten, // Pages written to DB (status='ready_for_indexing')
       urls_errored: errors.length,
       firecrawl_batch_ids: [batchJobId],
       errors,
@@ -320,7 +344,7 @@ export async function ingestWebsite(
     log.info(
       {
         websiteId: website.id,
-        domain,
+        baseDomain,
         pagesDiscovered: discoveredUrls.length,
         pagesScraped: pagesWritten,
         errors: errors.length,
@@ -329,7 +353,7 @@ export async function ingestWebsite(
     );
 
     // Step 9: Trigger indexing pipeline (separate process - fire and forget)
-    // This will pick up pages with status='processing' and upload to Gemini
+    // This will pick up pages with status='ready_for_indexing' and upload to Gemini
     // We don't await this - ingestion completes independently, indexing runs in background
     log.info({ websiteId: website.id, ingestionJobId: ingestionJob.id }, 'Triggering indexing pipeline (async)');
     
@@ -355,7 +379,7 @@ export async function ingestWebsite(
 
     return {
       websiteId: website.id,
-      domain,
+      domain: baseDomain,
       geminiStoreId: geminiStore.name,
       pagesDiscovered: discoveredUrls.length,
       pagesIndexed: pagesWritten, // Pages written (indexing will promote to 'active')

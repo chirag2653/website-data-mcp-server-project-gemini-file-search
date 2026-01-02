@@ -6,7 +6,7 @@
 // Database Types (matching Supabase schema)
 // ============================================================================
 
-export type PageStatus = 'pending' | 'processing' | 'active' | 'deleted' | 'redirect' | 'error';
+export type PageStatus = 'pending' | 'ready_for_indexing' | 'processing' | 'active' | 'deleted' | 'redirect' | 'error';
 export type SyncStatus = 'running' | 'completed' | 'failed';
 export type SyncType = 'full' | 'incremental' | 'manual';
 export type ProcessType = 'ingestion' | 'indexing' | 'sync' | 'manual_reindex';
@@ -41,7 +41,8 @@ export interface Page {
   http_status_code: number | null;
   gemini_file_id: string | null;
   gemini_file_name: string | null;
-  gemini_document_state: GeminiDocumentState | null;
+  // NOTE: gemini_document_state removed - document states tracked in process_jobs.metadata instead
+  // Since indexing is asynchronous, states are tracked in process_jobs, not pages table
   gemini_document_size_bytes: number | null;
   gemini_document_created_at: string | null;
   missing_count: number;
@@ -140,7 +141,8 @@ export interface PageUpdate {
   http_status_code?: number | null;
   gemini_file_id?: string;
   gemini_file_name?: string;
-  gemini_document_state?: GeminiDocumentState | null;
+  // NOTE: gemini_document_state removed - document states tracked in process_jobs.metadata instead
+  // Since indexing is asynchronous, states are tracked in process_jobs, not pages table
   gemini_document_size_bytes?: number | null;
   gemini_document_created_at?: string | null;
   missing_count?: number;
@@ -240,6 +242,10 @@ export interface GeminiFileSearchStore {
   displayName: string;
   createTime?: string;
   updateTime?: string;
+  activeDocumentsCount?: string;
+  pendingDocumentsCount?: string;
+  failedDocumentsCount?: string;
+  sizeBytes?: string;
 }
 
 export interface GeminiFileUploadResult {
