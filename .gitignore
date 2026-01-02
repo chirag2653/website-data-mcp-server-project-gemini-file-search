@@ -10,12 +10,15 @@ dist/
 .env.local
 .env.*.local
 
-# IDE
+# IDE and Editor files
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+.claude/
+anthropic_advanced_config
+.cursor/
 
 # OS
 .DS_Store
@@ -28,8 +31,12 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Test files (optional - remove if you want to commit tests)
-# test-*.js
+# Lock files
+*.lck
+crash_files.lck
+
+# Screaming Frog SEO Spider
+.ScreamingFrogSEOSpider/
 
 # Temporary files
 *.tmp
@@ -38,4 +45,7 @@ yarn-error.log*
 
 # Supabase local (if any)
 .supabase/
+
+# Test files (optional - remove if you want to commit tests)
+# test-*.js
 
