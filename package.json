@@ -1,56 +1,30 @@
 {
   "name": "website-data-mcp-server",
   "version": "1.0.0",
-  "description": "MCP server for website data ingestion and semantic querying using Gemini File Search",
+  "description": "Monorepo for website data MCP server and web UI",
+  "private": true,
   "type": "module",
-  "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint src --ext .ts",
-    "test": "vitest",
+    "mcp:dev": "pnpm -C apps/mcp-server dev",
+    "mcp:build": "pnpm -C apps/mcp-server build",
+    "mcp:start": "pnpm -C apps/mcp-server start",
+    "web:dev": "pnpm -C apps/web dev",
+    "web:build": "pnpm -C apps/web build",
+    "web:start": "pnpm -C apps/web start",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
     "cleanup": "tsx scripts/cleanup-gemini.ts",
     "cleanup:docs": "tsx scripts/cleanup-gemini.ts --docs-only",
-    "next:dev": "next dev",
-    "next:build": "next build",
-    "next:start": "next start"
-  },
-  "keywords": [
-    "mcp",
-    "gemini",
-    "firecrawl",
-    "supabase",
-    "semantic-search",
-    "rag"
-  ],
-  "author": "",
-  "license": "MIT",
-  "dependencies": {
-    "@google/genai": "^1.0.0",
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "@supabase/supabase-js": "^2.47.0",
-    "dotenv": "^16.4.5",
-    "next": "^15.0.0",
-    "pino": "^9.5.0",
-    "pino-pretty": "^13.0.0",
-    "react": "^18.3.0",
-    "react-dom": "^18.3.0",
-    "tailwindcss": "^3.4.0",
-    "zod": "^3.23.8"
+    "list:websites": "tsx scripts/list-websites.ts",
+    "test:ingestion": "tsx scripts/test-ingestion.ts",
+    "test:indexing": "tsx scripts/test-indexing.ts"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
-    "@types/react": "^18.3.0",
-    "@types/react-dom": "^18.3.0",
-    "autoprefixer": "^10.4.0",
-    "postcss": "^8.4.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.7.0",
-    "vitest": "^2.1.0"
+    "tsx": "^4.19.0"
   },
   "engines": {
-    "node": ">=20.0.0"
-  }
+    "node": ">=20.0.0",
+    "pnpm": ">=8.0.0"
+  },
+  "packageManager": "pnpm@8.15.0"
 }

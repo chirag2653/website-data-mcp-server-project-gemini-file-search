@@ -1,0 +1,99 @@
+{
+  "name": "@website-data/core",
+  "version": "1.0.0",
+  "description": "Core business logic for website ingestion, indexing, and search services",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./services/ingestion": {
+      "types": "./dist/services/ingestion.d.ts",
+      "default": "./dist/services/ingestion.js"
+    },
+    "./services/indexing": {
+      "types": "./dist/services/indexing.d.ts",
+      "default": "./dist/services/indexing.js"
+    },
+    "./services/search": {
+      "types": "./dist/services/search.d.ts",
+      "default": "./dist/services/search.js"
+    },
+    "./services/sync": {
+      "types": "./dist/services/sync.d.ts",
+      "default": "./dist/services/sync.js"
+    },
+    "./services/individual-url": {
+      "types": "./dist/services/individual-url.d.ts",
+      "default": "./dist/services/individual-url.js"
+    },
+    "./services/cleanup": {
+      "types": "./dist/services/cleanup.d.ts",
+      "default": "./dist/services/cleanup.js"
+    },
+    "./clients/supabase": {
+      "types": "./dist/clients/supabase.d.ts",
+      "default": "./dist/clients/supabase.js"
+    },
+    "./clients/firecrawl": {
+      "types": "./dist/clients/firecrawl.d.ts",
+      "default": "./dist/clients/firecrawl.js"
+    },
+    "./clients/gemini": {
+      "types": "./dist/clients/gemini.d.ts",
+      "default": "./dist/clients/gemini.js"
+    },
+    "./clients/gemini-http": {
+      "types": "./dist/clients/gemini-http.d.ts",
+      "default": "./dist/clients/gemini-http.js"
+    },
+    "./types": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/types/index.js"
+    },
+    "./types/index": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/types/index.js"
+    },
+    "./utils/logger": {
+      "types": "./dist/utils/logger.d.ts",
+      "default": "./dist/utils/logger.js"
+    },
+    "./utils/hash": {
+      "types": "./dist/utils/hash.d.ts",
+      "default": "./dist/utils/hash.js"
+    },
+    "./utils/url": {
+      "types": "./dist/utils/url.d.ts",
+      "default": "./dist/utils/url.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "default": "./dist/config.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "@supabase/supabase-js": "^2.47.0",
+    "dotenv": "^16.4.5",
+    "pino": "^9.5.0",
+    "pino-pretty": "^13.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
+

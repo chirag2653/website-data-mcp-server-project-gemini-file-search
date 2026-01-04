@@ -14,7 +14,7 @@
  *   tsx scripts/cleanup-gemini.ts [--docs-only] [--filter=pattern]
  */
 
-import * as cleanupService from '../src/services/cleanup.js';
+import * as cleanupService from '../packages/core/src/services/cleanup.js';
 
 async function main() {
   const args = process.argv.slice(2);
