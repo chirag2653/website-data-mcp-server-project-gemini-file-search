@@ -298,6 +298,7 @@ export interface IngestionResult {
   pagesDiscovered: number;
   pagesIndexed: number;
   errors: SyncError[];
+  ingestionJobId?: string; // Optional: Job ID for polling progress
 }
 
 export interface SyncResult {

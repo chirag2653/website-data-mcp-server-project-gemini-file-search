@@ -7,7 +7,7 @@ import * as supabase from '../clients/supabase.js';
 import * as gemini from '../clients/gemini.js';
 import { loggers } from '../utils/logger.js';
 import { normalizeDomain, extractBaseDomain } from '../utils/url.js';
-import { validateSearchInput } from './search-validation.js';
+import { z } from 'zod';
 import type { SearchResult } from '../types/index.js';
 
 const log = loggers.search;
@@ -28,12 +28,31 @@ export async function askQuestion(
   websiteDomain: string
 ): Promise<SearchResult> {
   // ========================================================================
-  // STEP 1: INPUT VALIDATION (Production-grade validation with Zod)
+  // STEP 1: INPUT VALIDATION
   // ========================================================================
   try {
-    const validated = validateSearchInput(question, websiteDomain);
-    question = validated.question;
-    websiteDomain = validated.websiteDomain;
+    // Validate question
+    const questionSchema = z
+      .string()
+      .min(1, 'Question cannot be empty')
+      .max(5000, 'Question must be 5000 characters or less')
+      .trim();
+    
+    question = questionSchema.parse(question);
+    
+    // Validate website domain
+    const domainSchema = z
+      .string()
+      .min(1, 'Website domain is required')
+      .refine(
+        (input) => {
+          const domainPattern = /([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}/i;
+          return domainPattern.test(input);
+        },
+        { message: 'Input must contain a valid domain (e.g., example.com or https://www.example.com)' }
+      );
+    
+    websiteDomain = domainSchema.parse(websiteDomain);
   } catch (validationError) {
     const message = validationError instanceof Error ? validationError.message : 'Invalid input';
     log.error({ question, websiteDomain, error: message }, 'Input validation failed');

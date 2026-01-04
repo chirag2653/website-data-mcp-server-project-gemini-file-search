@@ -32,6 +32,5 @@ export const loggers = {
   ingestion: createLogger('ingestion'),
   sync: createLogger('sync'),
   search: createLogger('search'),
-  lifecycle: createLogger('lifecycle'),
   mcp: createLogger('mcp'),
 };

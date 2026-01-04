@@ -5,7 +5,7 @@
 import { z } from 'zod';
 import * as ingestion from '../services/ingestion.js';
 import * as search from '../services/search.js';
-import * as lifecycle from '../services/lifecycle.js';
+import * as individualUrl from '../services/individual-url.js';
 import * as sync from '../services/sync.js';
 import { loggers } from '../utils/logger.js';
 
@@ -225,14 +225,14 @@ export async function handleToolCall(
 
       case 'site_get_url_status': {
         const parsed = SiteStatusSchema.parse(args);
-        const response = await lifecycle.getUrlStatus(parsed.url);
+        const response = await individualUrl.getUrlStatus(parsed.url);
         result = response;
         break;
       }
 
       case 'site_reindex_url': {
         const parsed = SiteReindexSchema.parse(args);
-        const response = await lifecycle.reindexUrl(parsed.url);
+        const response = await individualUrl.reindexUrl(parsed.url);
         result = response;
         break;
       }

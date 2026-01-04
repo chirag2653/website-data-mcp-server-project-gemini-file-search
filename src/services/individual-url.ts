@@ -1,19 +1,20 @@
 /**
- * Individual URL indexing service
- * Handles indexing a single URL (similar to Google Search Console - add individual URL)
+ * Individual URL service
+ * Handles individual URL operations: indexing, status checking, and reindexing
  * 
- * Requirements:
- * - Only works if website already exists (has pages from same domain)
- * - Uses direct scrape (not batch) for single URL
- * - Writes 'processing' status → triggers indexing pipeline
+ * - Indexing: Add a single URL to an existing website (Service 5)
+ * - Status: Get the current status of a URL
+ * - Reindex: Force re-scrape and re-index an existing URL
  */
 
 import * as supabase from '../clients/supabase.js';
 import * as firecrawl from '../clients/firecrawl.js';
+import * as gemini from '../clients/gemini.js';
 import * as indexingService from './indexing.js';
-import { computeContentHash } from '../utils/hash.js';
+import { computeContentHash, hasContentChanged } from '../utils/hash.js';
 import { extractDomain, extractPath, normalizeUrl } from '../utils/url.js';
 import { loggers } from '../utils/logger.js';
+import type { UrlStatusResult, ReindexResult } from '../types/index.js';
 
 const log = loggers.ingestion; // Reuse ingestion logger
 
@@ -171,5 +172,167 @@ export async function indexIndividualUrl(
       error: message,
     };
   }
+}
+
+/**
+ * Get the current status of a URL
+ */
+export async function getUrlStatus(url: string): Promise<UrlStatusResult> {
+  const normalizedUrl = normalizeUrl(url);
+  log.debug({ url: normalizedUrl }, 'Getting URL status');
+
+  const page = await supabase.getPageByUrl(normalizedUrl);
+
+  if (!page) {
+    return {
+      url: normalizedUrl,
+      status: 'pending',
+      lastScraped: null,
+      lastSeen: null,
+      contentHash: null,
+      error: null,
+      found: false,
+    };
+  }
+
+  return {
+    url: page.url,
+    status: page.status,
+    lastScraped: page.last_scraped,
+    lastSeen: page.last_seen,
+    contentHash: page.content_hash,
+    error: page.error_message,
+    found: true,
+  };
+}
+
+/**
+ * Force re-scrape and re-index a specific URL
+ */
+export async function reindexUrl(url: string): Promise<ReindexResult> {
+  const normalizedUrl = normalizeUrl(url);
+  log.info({ url: normalizedUrl }, 'Reindexing URL');
+
+  // Get existing page record
+  const page = await supabase.getPageByUrl(normalizedUrl);
+  if (!page) {
+    throw new Error(`URL not found in index: ${normalizedUrl}`);
+  }
+
+  // Get website for Gemini store reference
+  const website = await supabase.getWebsiteById(page.website_id);
+  if (!website || !website.gemini_store_id) {
+    throw new Error('Website or Gemini store not found');
+  }
+
+  // Scrape the URL
+  const scrapeResult = await firecrawl.scrapeUrl(normalizedUrl);
+  if (!scrapeResult.success || !scrapeResult.data) {
+    const error = scrapeResult.error ?? 'Scrape failed';
+    log.error({ url: normalizedUrl, error }, 'Reindex scrape failed');
+
+    await supabase.updatePage(page.id, {
+      status: 'error',
+      error_message: error,
+    });
+
+    return {
+      success: false,
+      url: normalizedUrl,
+      contentChanged: false,
+      previousHash: page.content_hash,
+      newHash: '',
+      message: `Scrape failed: ${error}`,
+    };
+  }
+
+  const content = scrapeResult.data.markdown;
+  const now = new Date().toISOString();
+
+  // Check if content changed
+  const { changed, newHash } = hasContentChanged(content, page.content_hash);
+
+  if (!changed) {
+    log.info({ url: normalizedUrl }, 'Content unchanged');
+
+    await supabase.updatePage(page.id, {
+      last_scraped: now,
+      last_seen: now,
+      error_message: null,
+      firecrawl_scrape_count: (page.firecrawl_scrape_count ?? 0) + 1,
+      http_status_code: scrapeResult.data.metadata.statusCode,
+    });
+
+    return {
+      success: true,
+      url: normalizedUrl,
+      contentChanged: false,
+      previousHash: page.content_hash,
+      newHash,
+      message: 'Content unchanged, updated timestamps',
+    };
+  }
+
+  // Content changed - delete old file and upload new one
+  log.info({ url: normalizedUrl }, 'Content changed, re-uploading');
+
+  // Phase 1: DB Draft - Save new markdown and hash, set status to 'ready_for_indexing'
+  await supabase.updatePage(page.id, {
+    status: 'ready_for_indexing',
+    title: scrapeResult.data.metadata.title,
+    content_hash: newHash,
+    markdown_content: content,
+    http_status_code: scrapeResult.data.metadata.statusCode,
+    firecrawl_scrape_count: (page.firecrawl_scrape_count ?? 0) + 1,
+    metadata: {
+      title: scrapeResult.data.metadata.title,
+      description: scrapeResult.data.metadata.description,
+      og_image: scrapeResult.data.metadata.ogImage,
+      language: scrapeResult.data.metadata.language,
+    },
+  });
+
+  // Phase 2: Delete old file if exists
+  if (page.gemini_file_id) {
+    try {
+      await gemini.deleteFileFromStore(website.gemini_store_id, page.gemini_file_id);
+    } catch (error) {
+      log.warn({ url: normalizedUrl, error }, 'Failed to delete old file');
+    }
+  }
+
+  // Phase 3: Upload new content to Gemini
+  const geminiFile = await gemini.uploadToFileSearchStore(
+    website.gemini_store_id,
+    content,
+    {
+      url: normalizedUrl,
+      title: scrapeResult.data.metadata.title ?? normalizedUrl,
+      path: extractPath(normalizedUrl),
+      lastUpdated: now,
+    }
+  );
+
+  // Phase 4: Final commit - Update with Gemini info and set to 'active'
+  await supabase.updatePage(page.id, {
+    status: 'active',
+    gemini_file_id: geminiFile.name,
+    gemini_file_name: geminiFile.displayName,
+    last_scraped: now,
+    last_seen: now,
+    missing_count: 0,
+    error_message: null,
+  });
+
+  log.info({ url: normalizedUrl }, 'Reindex complete');
+
+  return {
+    success: true,
+    url: normalizedUrl,
+    contentChanged: true,
+    previousHash: page.content_hash,
+    newHash,
+    message: 'Content updated and re-indexed',
+  };
 }
 
