@@ -4,6 +4,8 @@ package-lock.json
 
 # Build output
 dist/
+.next/
+apps/*/.next/
 
 # Environment variables
 .env
