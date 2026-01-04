@@ -253,11 +253,17 @@ export async function indexWebsite(
           // According to API docs: https://ai.google.dev/api/file-search/documents#endpoint
           // States: STATE_PENDING (processing), STATE_ACTIVE (ready), STATE_FAILED (error)
           // We ONLY mark as 'active' when state is ACTIVE (completely done)
-          // PENDING or FAILED → keep as 'ready_for_indexing' so it gets picked up in next indexing run
-          // IMPORTANT: Delete the uploaded file if not ACTIVE to avoid duplication on retry
+          // PENDING → keep as 'ready_for_indexing' so it gets checked again (document is processing normally)
+          // FAILED → delete document and keep as 'ready_for_indexing' so it can be retried
+          // IMPORTANT: Only delete FAILED documents, NOT PENDING ones (PENDING is normal processing state)
           let actualDocumentState: 'ACTIVE' | 'PROCESSING' | 'FAILED' = 'PROCESSING';
           let finalStatus: 'active' | 'ready_for_indexing' = 'ready_for_indexing';
           let shouldDeleteDocument = false;
+          
+          // Add a small delay before checking document state to avoid race conditions
+          // Gemini needs time to initialize the document after upload
+          // Wait 3 seconds to allow document to be fully created and state to be updated
+          await new Promise(resolve => setTimeout(resolve, 3000));
           
           try {
             // Check actual document state from Gemini API
@@ -277,24 +283,39 @@ export async function indexWebsite(
               shouldDeleteDocument = true; // Delete failed document to avoid duplication
             } else {
               // PENDING, STATE_PENDING, or unknown - still processing embeddings
-              // Delete it and retry (we'll upload fresh on next run)
+              // PENDING is a normal state - document is being processed by Gemini
+              // DO NOT delete - it will become ACTIVE once embeddings are generated
+              // Keep status as 'ready_for_indexing' so it can be checked again in next run
               actualDocumentState = 'PROCESSING';
-              finalStatus = 'ready_for_indexing'; // Back to ready for indexing so it can be retried
-              shouldDeleteDocument = true; // Delete pending document to avoid duplication
+              finalStatus = 'ready_for_indexing'; // Back to ready for indexing so it can be checked again
+              shouldDeleteDocument = false; // DO NOT delete PENDING documents - they're processing normally
             }
           } catch (docError) {
-            // If we can't verify document state, assume PENDING (conservative approach)
-            // This ensures we don't mark as active prematurely
-            log.warn(
-              { url: page.url, documentName: result.result.name, error: docError },
-              'Could not verify document state, deleting and will retry next run'
-            );
+            // If we can't verify document state, check if it's a 404 (document not initialized yet)
+            // or another error
+            const errorMessage = docError instanceof Error ? docError.message : 'Unknown error';
+            const isNotFound = errorMessage.includes('404') || errorMessage.includes('not found');
             
-            // Don't trust upload result state - always verify
-            // If verification fails, delete and retry
-            actualDocumentState = 'PROCESSING';
-            finalStatus = 'ready_for_indexing';
-            shouldDeleteDocument = true; // Delete since we can't verify state
+            if (isNotFound) {
+              // Document not found - might still be initializing after upload
+              // This is normal for newly uploaded documents - don't delete, just retry later
+              log.warn(
+                { url: page.url, documentName: result.result.name },
+                'Document not found yet (may still be initializing), will check again in next run'
+              );
+              actualDocumentState = 'PROCESSING';
+              finalStatus = 'ready_for_indexing';
+              shouldDeleteDocument = false; // Don't delete - document might still be initializing
+            } else {
+              // Other error - can't verify state, be conservative
+              log.warn(
+                { url: page.url, documentName: result.result.name, error: errorMessage },
+                'Could not verify document state, will retry next run'
+              );
+              actualDocumentState = 'PROCESSING';
+              finalStatus = 'ready_for_indexing';
+              shouldDeleteDocument = false; // Don't delete - might be a temporary API issue
+            }
           }
           
           // Delete document from Gemini if it didn't complete successfully
@@ -338,6 +359,11 @@ export async function indexWebsite(
           if (finalStatus === 'active') {
             updateData.gemini_file_id = result.result.name;
             updateData.gemini_file_name = result.result.displayName ?? undefined;
+          } else if (shouldDeleteDocument) {
+            // Document was deleted (FAILED state) - clear gemini_file_id so it can be re-uploaded
+            // This ensures the page will be picked up in next indexing run
+            updateData.gemini_file_id = undefined;
+            updateData.gemini_file_name = undefined;
           }
           
           await supabase.updatePage(page.id, updateData);
@@ -346,15 +372,28 @@ export async function indexWebsite(
           if (finalStatus === 'active') {
             pagesIndexed++;
           } else {
-            // PENDING or FAILED - deleted from Gemini, will be picked up in next indexing run
-            log.debug(
-              { 
-                url: page.url, 
-                documentState: actualDocumentState,
-                note: 'Document uploaded but not active, deleted and will retry next run'
-              },
-              'Document not yet active, deleted to avoid duplication'
-            );
+            // PENDING or FAILED - will be checked/retried in next indexing run
+            if (actualDocumentState === 'PROCESSING') {
+              // PENDING - document is processing normally, will check again next run
+              log.debug(
+                { 
+                  url: page.url, 
+                  documentState: actualDocumentState,
+                  note: 'Document uploaded and processing, will check state again in next run'
+                },
+                'Document processing (PENDING), will verify in next run'
+              );
+            } else {
+              // FAILED - document was deleted, will be re-uploaded next run
+              log.debug(
+                { 
+                  url: page.url, 
+                  documentState: actualDocumentState,
+                  note: 'Document failed and was deleted, will retry upload next run'
+                },
+                'Document failed, deleted and will retry next run'
+              );
+            }
           }
       } else {
         // Upload failed - keep status='ready_for_indexing' so it can be retried
@@ -363,9 +402,11 @@ export async function indexWebsite(
         errors.push({ url: page.url, error: errorMessage, timestamp: now });
 
         // Keep status as 'ready_for_indexing' so it gets picked up in next indexing run
-        // Don't update gemini_file_id (should already be null)
+        // Clear any stale gemini_file_id to ensure page can be retried
         await supabase.updatePage(page.id, {
           error_message: errorMessage,
+          gemini_file_id: undefined, // Clear stale file ID so page can be retried
+          gemini_file_name: undefined, // Clear stale file name
           // Status remains 'ready_for_indexing' - will be retried
         });
       }
