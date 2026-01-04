@@ -1,67 +1,155 @@
-# Website Data MCP Server
+# Website Data Indexing Core Modules
 
-An MCP (Model Context Protocol) server that turns any website into a queryable knowledge base for AI agents using Gemini File Search.
+A collection of framework-agnostic core modules for ingesting, indexing, syncing, and searching website content using FireCrawl, Supabase, and Gemini File Search. These modules can be used by any interface layer—currently exposed via an MCP server and a Next.js web application, with CLI testing tools for direct module testing.
 
-## Core Services
+## What This Is
 
-This server provides **five core services** that work together to ingest, index, sync, search, and manage website content:
+This is **not just an MCP server**—it's a modular system of core business logic that can be consumed by any interface:
 
-### 1. Ingestion Service (`packages/core/src/services/ingestion.ts`)
-Initial website crawl and indexing. Discovers all pages via FireCrawl `/map`, batch scrapes content, stores metadata and markdown in Supabase, and prepares content for indexing. Creates the Gemini File Search store and website record.
+- **Core Modules** (`packages/core/src/services/`): Framework-agnostic business logic for website data operations
+- **Interface Layers** (`apps/`): Thin wrappers that expose core modules via different protocols
+  - **MCP Server** (`apps/mcp-server/`): Exposes core modules via Model Context Protocol for AI agents
+  - **Next.js App** (`apps/web/`): Provides a web UI for managing and testing core modules
+- **Testing Layer** (`scripts/`): CLI tools for directly testing core modules without running servers
 
-**What it does:**
-- Creates Gemini File Search store for the website
-- Discovers all URLs via FireCrawl
-- Batch scrapes all pages
-- Stores content in Supabase with status `ready_for_indexing`
-- Triggers indexing pipeline
+## Core Modules
 
-**MCP Tool**: `site_ingest`
+### 1. Ingestion Module (`packages/core/src/services/ingestion.ts`)
 
-### 2. Indexing Service (`packages/core/src/services/indexing.ts`)
-Uploads stored markdown content to Gemini File Search for semantic retrieval. This service is **in development** and does not automatically trigger. Content is stored and ready for indexing, but indexing must be manually triggered.
+**Purpose**: Initial website crawl and content discovery. Discovers all pages on a website, scrapes their content, and stores it in the database ready for indexing.
 
-**What it does:**
-- Reads pages with status `ready_for_indexing` from Supabase
-- Uploads markdown content to Gemini File Search
-- Updates page status to `active` after successful upload
-- Handles retries without re-scraping (uses stored markdown)
+**Workflow**: Takes a seed URL and optional display name. Creates a Gemini File Search store, discovers all URLs via FireCrawl's `/map` endpoint, batch scrapes all pages using FireCrawl's batch API, validates and stores complete markdown content in Supabase with status `ready_for_indexing`, and creates a website record. Discards incomplete scrapes (missing markdown, empty content) to ensure data quality.
 
-**Status**: In the works - does not trigger automatically
+**Input**: `seedUrl` (string), `displayName` (optional string)
 
-### 3. Sync Service (`packages/core/src/services/sync.ts`)
-Incremental updates and refresh of website content. Discovers new pages, refreshes stale content, and handles deletions using a safe threshold-based approach.
+**Processing**: FireCrawl URL discovery → Batch scraping → Content validation → Database storage
 
-**What it does:**
-- Re-runs FireCrawl `/map` to discover current URLs
-- Categorizes URLs: NEW, CHANGED, UNCHANGED, MISSING
-- Scrapes and indexes new/changed pages
-- Uses content hashes to detect changes
-- Safely handles deletions (requires 3 consecutive misses before deletion)
+**Output**: Returns `IngestionResult` with website ID, domain, Gemini store ID, pages discovered count, pages scraped count, and any errors encountered.
 
-**MCP Tool**: `site_sync`
+### 2. Indexing Module (`packages/core/src/services/indexing.ts`)
 
-### 4. Search Service (`packages/core/src/services/search.ts`)
-Semantic search queries using Gemini File Search. Ask questions, check for existing content, and find mentions of keywords across the indexed website.
+**Purpose**: Uploads stored markdown content to Gemini File Search for semantic search. Separated from ingestion to allow retries without re-scraping.
 
-**What it does:**
-- Executes semantic queries using Gemini File Search
-- Returns grounded answers with source citations
-- Checks for existing content about topics
-- Finds pages mentioning specific keywords
+**Workflow**: Takes a website ID and optional job metadata. Reads all pages with status `ready_for_indexing` from Supabase, ensures the Gemini File Search store exists (creates if needed), uploads markdown content to Gemini File Search as documents, updates page status to `active` after successful upload, and stores Gemini file IDs for future reference. Handles retries gracefully using stored markdown.
 
-**MCP Tools**: `site_ask`, `site_check_existing_content`, `site_find_mentions`
+**Input**: `websiteId` (string), `options` (optional: `ingestionJobId`, `syncJobId`, `autoCreateStore`)
 
-### 5. Individual URL Service (`packages/core/src/services/individual-url.ts`)
-Single URL operations for existing websites. Handles indexing new URLs, checking status, and reindexing existing URLs. Similar to Google Search Console's "add individual URL" feature.
+**Processing**: Database query → Gemini store verification → Markdown upload → Status updates
 
-**What it does:**
-- Indexes a single URL for an existing website
-- Gets the status of a specific URL
-- Re-scrapes and re-indexes an existing URL
-- Validates URL belongs to the website's domain
+**Output**: Returns `IndexingResult` with indexing job ID, website ID, pages indexed count, and any errors encountered.
 
-**MCP Tools**: `site_reindex_url`, `site_get_url_status`
+### 3. Sync Module (`packages/core/src/services/sync.ts`)
+
+**Purpose**: Incremental updates and refresh of website content. Discovers new pages, detects changed content, and safely handles deletions using a threshold-based approach.
+
+**Workflow**: Takes a website ID. Re-runs FireCrawl `/map` to get current URLs, compares with existing database records to categorize URLs (NEW, CHANGED, UNCHANGED, MISSING), scrapes new and changed pages, uses content hashes to detect changes, updates unchanged pages with fresh timestamps, increments missing count for URLs not found, and only deletes URLs after 3 consecutive misses (prevents false deletions from temporary issues). Automatically triggers indexing for new/changed pages.
+
+**Input**: `websiteId` (string)
+
+**Processing**: URL discovery → Categorization → Change detection → Selective scraping → Safe deletion → Indexing trigger
+
+**Output**: Returns `SyncResult` with sync job ID, URLs discovered, URLs updated, URLs deleted, and any errors encountered.
+
+### 4. Search Module (`packages/core/src/services/search.ts`)
+
+**Purpose**: Semantic search queries using Gemini File Search. Ask questions, check for existing content, and find keyword mentions across indexed websites.
+
+**Workflow**: Takes a question and website domain. Validates and normalizes the domain input, looks up the website by base domain (handles www vs non-www), verifies the website has a Gemini File Search store, executes semantic query using Gemini File Search API, generates grounded answers with source citations, and returns formatted results with answer text and source URLs.
+
+**Input**: `question` (string), `websiteDomain` (string - can be URL, domain, or domain with path)
+
+**Processing**: Input validation → Domain normalization → Website lookup → Gemini File Search query → Answer generation
+
+**Output**: Returns `SearchResult` with answer text, source citations (URLs, titles, snippets), and metadata.
+
+### 5. Individual URL Module (`packages/core/src/services/individual-url.ts`)
+
+**Purpose**: Single URL operations for existing websites. Handles indexing new URLs, checking status, and reindexing existing URLs—similar to Google Search Console's "add individual URL" feature.
+
+**Workflow**: Takes a website ID and URL. Validates the URL belongs to the website's exact domain, verifies the website has existing pages (requirement for individual URL operations), scrapes the URL using FireCrawl's direct scrape API, validates content completeness, stores the page in database with status `processing`, triggers indexing for the single URL, and updates status to `active` after successful indexing. Also provides status checking and reindexing functions.
+
+**Input**: `websiteId` (string), `url` (string)
+
+**Processing**: Domain validation → URL scraping → Content validation → Database storage → Indexing trigger
+
+**Output**: Returns `IndividualUrlResult` with success status, website ID, URL, current status, and any error messages.
+
+### 6. Cleanup Module (`packages/core/src/services/cleanup.ts`)
+
+**Purpose**: Utility module for cleaning up Gemini File Search stores and documents. Useful for testing, resetting, or removing old data.
+
+**Workflow**: Takes cleanup options (delete stores flag, store filter pattern). Lists all Gemini File Search stores (optionally filtered), deletes all documents from each store, optionally deletes the stores themselves, handles rate limiting and retries with exponential backoff, and provides detailed cleanup reports.
+
+**Input**: `options` (object: `deleteStores` boolean, `storeFilter` optional string pattern)
+
+**Processing**: Store enumeration → Document deletion → Optional store deletion → Error handling
+
+**Output**: Returns `CleanupResult` with stores deleted count, documents deleted count, per-store details, and any errors encountered.
+
+## Testing Core Modules
+
+Each core module can be tested directly using CLI tools in the `scripts/` directory. These tools provide a command-line interface for testing modules without running the MCP server or web application.
+
+### Test Ingestion Module
+
+**Command**: `pnpm test:ingestion <url> [displayName]`
+
+**Example**:
+```bash
+pnpm test:ingestion https://www.peersignal.org/ "PeerSignal"
+```
+
+**What it does**: Validates the input URL and optional display name, calls the ingestion module to create a Gemini File Search store, discovers all URLs via FireCrawl, batch scrapes all pages, stores pages in the database with status `ready_for_indexing`, and outputs the website ID, domain, Gemini store ID, pages discovered count, pages scraped count, and any errors.
+
+**Output**: Website ID (for use in subsequent indexing), domain, Gemini Store ID, pages discovered, pages scraped, and error list.
+
+### Test Indexing Module
+
+**Command**: `pnpm test:indexing <websiteId>`
+
+**Example**:
+```bash
+pnpm test:indexing a0001d33-25ee-41b5-b79a-0dbac05296fb
+```
+
+**Prerequisites**: Website must exist in database and have pages with status `ready_for_indexing` and `markdown_content`.
+
+**What it does**: Verifies the website exists in the database, checks for pages ready for indexing, calls the indexing module to upload markdown content to Gemini File Search, updates page status to `active` after successful upload, and outputs the indexing job ID, pages indexed count, and any errors.
+
+**Output**: Indexing job ID, website ID, pages indexed count, and error list.
+
+### Test Search Module
+
+**Command**: `pnpm test:search <question> <websiteDomain>`
+
+**Example**:
+```bash
+pnpm test:search "What is PeerSignal about?" "peersignal.org"
+```
+
+**Prerequisites**: Website must exist in database and have indexed pages (run indexing first).
+
+**What it does**: Validates the question and website domain input, calls the search module to execute a semantic query using Gemini File Search, formats and displays the answer with source citations, and outputs the answer text, source URLs, titles, and snippets.
+
+**Output**: Answer text, source citations (URLs, titles, snippets), and metadata.
+
+### List Websites
+
+**Command**: `pnpm list:websites`
+
+**What it does**: Queries the database for all websites, formats and displays website details, and outputs website IDs for use in other test commands.
+
+**Output**: Website ID, domain, display name, Gemini Store ID, and created date for each website.
+
+### Cleanup Gemini Stores
+
+**Commands**: 
+- `pnpm cleanup` - Full cleanup (delete stores and documents)
+- `pnpm cleanup:docs` - Partial cleanup (delete documents only, keep stores)
+
+**What it does**: Calls the cleanup module to enumerate all Gemini File Search stores, deletes all documents from each store, optionally deletes the stores themselves (full cleanup mode), handles rate limiting and retries, and outputs cleanup statistics including stores processed, stores deleted, documents deleted, and any errors.
+
+**Output**: Stores processed count, stores deleted count, documents deleted count, per-store details, and error list.
 
 ## Quick Start
 
@@ -97,7 +185,7 @@ GEMINI_MODEL=gemini-2.5-flash
 
 Run the migrations in `supabase/migrations/` against your Supabase database.
 
-### Run
+### Running Interface Layers
 
 ```bash
 # Run MCP server (development)
@@ -114,17 +202,6 @@ pnpm mcp:start
 pnpm web:start
 ```
 
-## MCP Tools
-
-- **`site_ingest`** - Ingest a new website (Service 1: Ingestion)
-- **`site_sync`** - Sync an existing website (Service 3: Sync)
-- **`site_ask`** - Ask questions about website content (Service 4: Search)
-- **`site_check_existing_content`** - Check if content already exists (Service 4: Search)
-- **`site_find_mentions`** - Find pages mentioning keywords (Service 4: Search)
-- **`site_reindex_url`** - Re-index a single URL (Service 5: Individual URL)
-- **`site_get_url_status`** - Get status of a specific URL (Service 5: Individual URL)
-- **`site_list`** - List all indexed websites
-
 ## Architecture
 
 ```
@@ -134,7 +211,7 @@ Website → FireCrawl → Supabase → Gemini File Search → AI Agents
 1. **FireCrawl** discovers and scrapes website content
 2. **Supabase** stores metadata, content hashes, and markdown (system of record)
 3. **Gemini File Search** provides semantic search capabilities
-4. **MCP Tools** expose clean interfaces for AI agents
+4. **Interface Layers** (MCP, Next.js, CLI) expose core modules to different consumers
 
 ## Project Structure
 
@@ -144,7 +221,7 @@ This project uses a **monorepo architecture** with clear separation between core
 ├── packages/
 │   └── core/                    # Core business logic (framework-agnostic)
 │       ├── src/
-│       │   ├── services/        # Core services (ingestion, indexing, sync, search, etc.)
+│       │   ├── services/        # Core modules (ingestion, indexing, sync, search, etc.)
 │       │   ├── clients/         # API clients (Supabase, FireCrawl, Gemini)
 │       │   ├── types/           # TypeScript type definitions
 │       │   ├── utils/           # Utilities (hashing, URL parsing, logging)
@@ -155,151 +232,47 @@ This project uses a **monorepo architecture** with clear separation between core
 │   ├── mcp-server/              # MCP server interface layer
 │   │   ├── src/
 │   │   │   ├── index.ts         # MCP server entry point
-│   │   │   └── tools/           # MCP tool definitions
+│   │   │   └── tools/           # MCP tool definitions (wrappers around core modules)
 │   │   └── package.json
 │   │
 │   └── web/                     # Next.js web interface
 │       ├── app/                  # Next.js App Router
 │       └── package.json
 │
-├── scripts/                      # Test scripts for core modules
-│   ├── test-ingestion.ts        # Test ingestion service
-│   ├── test-indexing.ts         # Test indexing service
-│   ├── test-search.ts           # Test search service
-│   ├── cleanup-gemini.ts        # Cleanup utility
-│   └── list-websites.ts         # List websites utility
+├── scripts/                      # CLI testing tools for core modules
+│   ├── test-ingestion.ts        # Test ingestion module
+│   ├── test-indexing.ts         # Test indexing module
+│   ├── test-search.ts           # Test search module
+│   ├── cleanup-gemini.ts        # Test cleanup module
+│   └── list-websites.ts         # Utility to list websites
 │
 └── package.json                  # Root workspace configuration
 ```
 
 ### Architecture Philosophy
 
-**Core Logic (`packages/core/`):**
+**Core Modules (`packages/core/`):**
 - Framework-agnostic business logic
 - Can be used by any interface (MCP, REST API, CLI, etc.)
 - Fully testable independently
 - No dependencies on interface layers
+- Self-contained with input validation using Zod
 
 **Interface Layers (`apps/`):**
-- Thin wrappers around core logic
-- MCP server: Exposes core services via MCP protocol
-- Next.js app: Provides web UI for core services
+- Thin wrappers around core modules
+- MCP server: Exposes core modules via MCP protocol for AI agents
+- Next.js app: Provides web UI for core modules
 - Easy to add new interfaces (CLI, REST API, etc.)
 
-## Testing Core Modules
+**Testing Layer (`scripts/`):**
+- Direct CLI access to core modules
+- Fast iteration without running servers
+- Isolated testing of individual modules
+- CLI-friendly for CI/CD pipelines
 
-The core business logic can be tested directly using test scripts, without needing to run the MCP server or web interface.
+## Complete Testing Workflow
 
-### Available Test Scripts
-
-All test scripts are located in the `scripts/` directory and can be run from the project root:
-
-#### 1. Test Ingestion Service
-
-Tests the ingestion service directly - discovers URLs, scrapes content, and stores pages in the database.
-
-```bash
-pnpm test:ingestion <url> [displayName]
-```
-
-**Example:**
-```bash
-pnpm test:ingestion https://www.peersignal.org/ "PeerSignal"
-```
-
-**What it does:**
-- Validates input (URL and optional display name)
-- Creates Gemini File Search store
-- Discovers all URLs via FireCrawl
-- Batch scrapes all pages
-- Stores pages in database with status `ready_for_indexing`
-- Returns website ID for subsequent indexing
-
-**Output:**
-- Website ID
-- Domain
-- Gemini Store ID
-- Pages discovered
-- Pages scraped
-- Errors (if any)
-
-#### 2. Test Indexing Service
-
-Tests the indexing service directly - uploads stored markdown content to Gemini File Search.
-
-```bash
-pnpm test:indexing <websiteId>
-```
-
-**Example:**
-```bash
-pnpm test:indexing a0001d33-25ee-41b5-b79a-0dbac05296fb
-```
-
-**Prerequisites:**
-- Website must exist in database
-- Website must have pages with status `ready_for_indexing`
-- Pages must have `markdown_content`
-
-**What it does:**
-- Verifies website exists
-- Checks for pages ready for indexing
-- Uploads markdown content to Gemini File Search
-- Updates page status to `active`
-- Returns indexing results
-
-#### 3. Test Search Service
-
-Tests the search service directly - asks questions about website content using Gemini File Search.
-
-```bash
-pnpm test:search <question> <websiteDomain>
-```
-
-**Example:**
-```bash
-pnpm test:search "What is PeerSignal about?" "peersignal.org"
-```
-
-**Prerequisites:**
-- Website must exist in database
-- Website must have indexed pages (run indexing first)
-
-**What it does:**
-- Validates question and domain
-- Executes semantic search query
-- Returns answer with source citations
-
-#### 4. List Websites
-
-Lists all websites in the database with their details.
-
-```bash
-pnpm list:websites
-```
-
-**Output:**
-- Website ID
-- Domain
-- Display name
-- Gemini Store ID
-- Created date
-
-#### 5. Cleanup Gemini Stores
-
-Cleans up Gemini File Search stores and documents.
-
-```bash
-# Full cleanup (delete stores and documents)
-pnpm cleanup
-
-# Partial cleanup (delete documents only, keep stores)
-pnpm cleanup:docs
-```
-
-### Testing Workflow
-
-**Complete testing workflow:**
+**End-to-end testing example:**
 
 ```bash
 # 1. Test ingestion
@@ -313,21 +286,18 @@ pnpm test:indexing abc123-def456-...
 pnpm test:search "What is this website about?" "example.com"
 ```
 
-### Why Test Scripts?
+## MCP Tools (Interface Layer)
 
-- **Direct testing**: Test core logic without interface layers
-- **Fast iteration**: No need to start servers or build apps
-- **Isolated testing**: Test individual services independently
-- **CLI-friendly**: Easy to use in CI/CD pipelines
-- **Debugging**: Quick way to test changes to core modules
+When using the MCP server interface, these tools are available:
 
-### Core Module Structure
-
-Each core service in `packages/core/src/services/` is:
-- **Self-contained**: All business logic in one place
-- **Validated**: Input validation using Zod
-- **Testable**: Can be imported and tested directly
-- **Reusable**: Used by MCP server, web app, and test scripts
+- **`site_ingest`** - Ingest a new website (uses Ingestion Module)
+- **`site_sync`** - Sync an existing website (uses Sync Module)
+- **`site_ask`** - Ask questions about website content (uses Search Module)
+- **`site_check_existing_content`** - Check if content already exists (uses Search Module)
+- **`site_find_mentions`** - Find pages mentioning keywords (uses Search Module)
+- **`site_reindex_url`** - Re-index a single URL (uses Individual URL Module)
+- **`site_get_url_status`** - Get status of a specific URL (uses Individual URL Module)
+- **`site_list`** - List all indexed websites
 
 ## License
 
