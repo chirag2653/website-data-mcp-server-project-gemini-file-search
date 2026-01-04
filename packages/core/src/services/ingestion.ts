@@ -600,7 +600,7 @@ export async function ingestWebsite(
         discovered: discoveredUrls.length,
         scraped: scrapeResult.completed,
         written: pagesWritten,
-        discarded: scrapedData.length - pagesWritten
+        discarded: (scrapeResult.data?.length ?? scrapeResult.completed) - pagesWritten
       },
       'Ingestion scraping phase complete'
     );

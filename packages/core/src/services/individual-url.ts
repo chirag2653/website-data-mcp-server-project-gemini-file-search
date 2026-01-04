@@ -11,10 +11,11 @@ import * as supabase from '../clients/supabase.js';
 import * as firecrawl from '../clients/firecrawl.js';
 import * as gemini from '../clients/gemini.js';
 import * as indexingService from './indexing.js';
+import { batchScrapeAndProcess } from './ingestion.js';
 import { computeContentHash, hasContentChanged } from '../utils/hash.js';
-import { extractDomain, extractPath, normalizeUrl } from '../utils/url.js';
+import { extractDomain, extractBaseDomain, extractPath, normalizeUrl, normalizeDomain } from '../utils/url.js';
 import { loggers } from '../utils/logger.js';
-import type { UrlStatusResult, ReindexResult } from '../types/index.js';
+import type { UrlStatusResult, ReindexResult, SyncError } from '../types/index.js';
 
 const log = loggers.ingestion; // Reuse ingestion logger
 
@@ -27,149 +28,288 @@ export interface IndividualUrlResult {
 }
 
 /**
- * Index a single URL for an existing website
+ * Index a single URL (user-friendly function)
  * 
- * @param websiteId - The website ID (must exist)
+ * Takes just a URL and handles all the logic:
+ * - Automatically finds website by domain
+ * - Validates website exists and has pages
+ * - Uses batchScrapeAndProcess (same as ingestion/sync)
+ * - Marks as 'ready_for_indexing'
+ * - Triggers indexing service (like sync does)
+ * 
+ * Similar to Google Search Console's "Request Indexing" feature.
+ * 
  * @param url - The URL to index
- * @returns Result with status
+ * @returns Result with status and helpful messages
  */
 export async function indexIndividualUrl(
-  websiteId: string,
   url: string
-): Promise<IndividualUrlResult> {
+): Promise<IndividualUrlResult & { 
+  message?: string;
+  suggestion?: string;
+  canAutoIngest?: boolean;
+}> {
   const normalizedUrl = normalizeUrl(url);
-  const domain = extractDomain(normalizedUrl);
+  log.info({ url: normalizedUrl }, 'Requesting indexing for URL');
 
-  log.info({ websiteId, url: normalizedUrl }, 'Starting individual URL indexing');
+  // Step 1: Extract base domain from URL
+  const extractedDomain = normalizeDomain(normalizedUrl);
+  const baseDomain = extractBaseDomain(extractedDomain);
 
-  // Step 1: Verify website exists
-  const website = await supabase.getWebsiteById(websiteId);
+  if (!baseDomain || baseDomain.trim().length === 0) {
+    return {
+      success: false,
+      websiteId: '',
+      url: normalizedUrl,
+      status: 'error',
+      error: 'Could not extract a valid domain from the URL',
+      message: 'Invalid URL format. Please provide a valid URL (e.g., https://example.com/page)',
+    };
+  }
+
+  log.info({ url: normalizedUrl, baseDomain }, 'Extracted base domain');
+
+  // Step 2: Find website by base domain
+  const website = await supabase.getWebsiteByDomain(baseDomain);
+
   if (!website) {
-    throw new Error('Website not found');
+    return {
+      success: false,
+      websiteId: '',
+      url: normalizedUrl,
+      status: 'error',
+      error: `Website not found for domain: ${baseDomain}`,
+      message: `This domain (${baseDomain}) has never been indexed.`,
+      suggestion: `Would you like to ingest and index this website? Use site_ingest with the homepage URL (e.g., https://${baseDomain})`,
+      canAutoIngest: true,
+    };
   }
 
-  // Step 2: Verify URL is from same exact domain
-  // Each domain/subdomain is separate - must match exactly
-  if (domain !== website.domain) {
-    throw new Error(`URL domain (${domain}) does not match website domain (${website.domain}). Each domain/subdomain is a separate website.`);
+  log.info({ websiteId: website.id, domain: website.domain }, 'Website found');
+
+  // Step 3: Validate URL domain matches website domain
+  const urlDomain = extractDomain(normalizedUrl);
+  const urlBaseDomain = extractBaseDomain(urlDomain);
+  
+  if (urlBaseDomain !== baseDomain) {
+    return {
+      success: false,
+      websiteId: website.id,
+      url: normalizedUrl,
+      status: 'error',
+      error: `URL domain (${urlBaseDomain}) does not match website domain (${baseDomain})`,
+      message: `The URL domain does not match the website domain. Each domain/subdomain is a separate website.`,
+    };
   }
 
-  // Step 3: Verify website has existing pages (requirement: website must have pages)
-  const existingPages = await supabase.getPagesByWebsite(websiteId);
+  // Step 4: Check if website has existing pages
+  const existingPages = await supabase.getPagesByWebsite(website.id);
+  
   if (existingPages.length === 0) {
-    throw new Error('Website has no existing pages. Use ingestion pipeline instead.');
-  }
-
-  log.info(
-    { websiteId, domain, existingPagesCount: existingPages.length },
-    'Website verified - has existing pages'
-  );
-
-  // Step 4: Scrape URL using direct scrape (not batch)
-  log.info({ url: normalizedUrl }, 'Scraping individual URL');
-  const scrapeResult = await firecrawl.scrapeUrl(normalizedUrl);
-
-  if (!scrapeResult.success || !scrapeResult.data) {
-    const error = scrapeResult.error || 'Scrape failed';
-    log.error({ url: normalizedUrl, error }, 'Failed to scrape URL');
     return {
       success: false,
-      websiteId,
+      websiteId: website.id,
       url: normalizedUrl,
       status: 'error',
-      error,
+      error: 'Website has no existing pages',
+      message: `Website exists but has no indexed pages yet.`,
+      suggestion: `Would you like to ingest and index this website? Use site_ingest with the homepage URL (e.g., https://${baseDomain})`,
+      canAutoIngest: true,
     };
   }
 
-  // Step 5: Validate completeness
-  if (!scrapeResult.data.markdown || scrapeResult.data.markdown.trim().length === 0) {
-    const error = 'Empty content after scraping';
-    log.warn({ url: normalizedUrl }, error);
-    return {
-      success: false,
-      websiteId,
-      url: normalizedUrl,
-      status: 'error',
-      error,
-    };
+  // Step 5: Check if URL already exists
+  const existingPage = await supabase.getPageByUrl(normalizedUrl);
+  
+  if (existingPage) {
+    // Verify the existing page belongs to the same website
+    if (existingPage.website_id !== website.id) {
+      return {
+        success: false,
+        websiteId: website.id,
+        url: normalizedUrl,
+        status: 'error',
+        error: 'URL exists but belongs to a different website',
+        message: `This URL is already indexed but belongs to a different website.`,
+      };
+    }
+
+    if (existingPage.status === 'active') {
+      return {
+        success: true,
+        websiteId: website.id,
+        url: normalizedUrl,
+        status: 'active',
+        message: 'URL is already indexed and active',
+      };
+    } else if (existingPage.status === 'ready_for_indexing') {
+      // Already scraped, just trigger indexing
+      log.info({ url: normalizedUrl }, 'URL already scraped, triggering indexing');
+      try {
+        await indexingService.indexWebsite(website.id, {});
+        
+        // Check if page is now active after indexing
+        const updatedPage = await supabase.getPageByUrl(normalizedUrl);
+        if (updatedPage?.status === 'active') {
+          return {
+            success: true,
+            websiteId: website.id,
+            url: normalizedUrl,
+            status: 'active',
+            message: 'URL was already scraped and has been indexed successfully',
+          };
+        }
+        
+        return {
+          success: true,
+          websiteId: website.id,
+          url: normalizedUrl,
+          status: 'processing',
+          message: 'URL was already scraped, indexing has been triggered',
+        };
+      } catch (error) {
+        return {
+          success: true,
+          websiteId: website.id,
+          url: normalizedUrl,
+          status: 'processing',
+          message: 'URL was already scraped, indexing will be processed shortly',
+        };
+      }
+    }
+    // If status is error/pending/processing, we'll re-scrape it
   }
 
-  // Step 6: Write to DB with status='processing'
-  const now = new Date().toISOString();
-  const contentHash = computeContentHash(scrapeResult.data.markdown);
+  // Step 6: Create process job for tracking
+  const processJob = await supabase.createProcessJob({
+    website_id: website.id,
+    process_type: 'manual_reindex',
+    status: 'running',
+  });
+
+  const errors: SyncError[] = [];
 
   try {
-    const page = await supabase.upsertPage({
-      website_id: websiteId,
-      url: normalizedUrl,
-      path: extractPath(normalizedUrl),
-      title: scrapeResult.data.metadata.title,
-      status: 'processing', // Not 'active' yet - indexing will promote it
-      content_hash: contentHash,
-      metadata: {
-        title: scrapeResult.data.metadata.title,
-        description: scrapeResult.data.metadata.description,
-        og_image: scrapeResult.data.metadata.ogImage,
-        language: scrapeResult.data.metadata.language,
-      },
-    });
+    // Step 7: Use batchScrapeAndProcess (same as ingestion/sync) for consistent behavior
+    log.info({ websiteId: website.id, url: normalizedUrl }, 'Scraping URL using batch scrape');
+    const { batchJobId, pagesWritten, scrapeResult } = await batchScrapeAndProcess(
+      [normalizedUrl],
+      website.id,
+      processJob.id,
+      errors,
+      {
+        trackProgress: false, // Single URL, no need for progress tracking
+      }
+    );
 
-    // Update with additional fields
-    await supabase.updatePage(page.id, {
-      markdown_content: scrapeResult.data.markdown,
-      http_status_code: scrapeResult.data.metadata.statusCode,
-      firecrawl_scrape_count: 1,
-      last_seen: now,
-      error_message: null,
-    });
-
-    log.info({ url: normalizedUrl }, 'URL written to DB (status=processing) - triggering indexing');
-
-    // Step 7: Trigger indexing pipeline (will upload to Gemini and set to 'active')
-    try {
-      await indexingService.indexWebsite(websiteId, {
-        // No specific process job ID - will index all 'processing' pages for this website
+    if (!batchJobId || !scrapeResult.success) {
+      const errorMessage = scrapeResult.error || 'Batch scrape failed';
+      await supabase.updateProcessJob(processJob.id, {
+        completed_at: new Date().toISOString(),
+        errors,
+        status: 'failed',
       });
 
-      // Check if page is now active
-      const updatedPage = await supabase.getPageByUrl(normalizedUrl);
-      if (updatedPage?.status === 'active') {
+      return {
+        success: false,
+        websiteId: website.id,
+        url: normalizedUrl,
+        status: 'error',
+        error: errorMessage,
+        message: `Failed to scrape URL: ${errorMessage}`,
+      };
+    }
+
+    // Step 8: Check if page was written (processScrapedPages writes with status='ready_for_indexing')
+    const updatedPage = await supabase.getPageByUrl(normalizedUrl);
+    
+    if (!updatedPage) {
+      await supabase.updateProcessJob(processJob.id, {
+        completed_at: new Date().toISOString(),
+        errors,
+        status: 'failed',
+      });
+
+      return {
+        success: false,
+        websiteId: website.id,
+        url: normalizedUrl,
+        status: 'error',
+        error: 'Page was not written to database',
+        message: 'URL was scraped but not written to database (likely empty or invalid content)',
+      };
+    }
+
+    // Step 9: Update process job
+    await supabase.updateProcessJob(processJob.id, {
+      completed_at: new Date().toISOString(),
+      urls_discovered: 1,
+      urls_updated: pagesWritten,
+      urls_errored: errors.length,
+      firecrawl_batch_ids: [batchJobId],
+      errors,
+      status: 'completed',
+    });
+
+    // Step 10: Trigger indexing pipeline (like sync does)
+    log.info({ websiteId: website.id, url: normalizedUrl }, 'Triggering indexing pipeline');
+    try {
+      await indexingService.indexWebsite(website.id, {});
+      log.info({ websiteId: website.id, url: normalizedUrl }, 'Indexing pipeline triggered');
+      
+      // Check if page is now active after indexing
+      const finalPage = await supabase.getPageByUrl(normalizedUrl);
+      if (finalPage?.status === 'active') {
+        log.info(
+          { websiteId: website.id, url: normalizedUrl, status: finalPage.status },
+          'URL scraped, indexed, and is now active'
+        );
+        
         return {
           success: true,
-          websiteId,
+          websiteId: website.id,
           url: normalizedUrl,
           status: 'active',
-        };
-      } else {
-        return {
-          success: true,
-          websiteId,
-          url: normalizedUrl,
-          status: 'processing', // Still processing - indexing may be in progress
+          message: 'URL successfully scraped and indexed. The page is now searchable.',
         };
       }
     } catch (indexingError) {
       // Don't fail - page is written, indexing can be retried
-      log.error(
-        { websiteId, url: normalizedUrl, error: indexingError },
+      log.warn(
+        { websiteId: website.id, url: normalizedUrl, error: indexingError },
         'Indexing pipeline failed (can be retried later)'
       );
-      return {
-        success: true,
-        websiteId,
-        url: normalizedUrl,
-        status: 'processing', // Written but indexing pending
-      };
     }
-  } catch (dbError) {
-    const message = dbError instanceof Error ? dbError.message : 'Unknown error';
-    log.error({ url: normalizedUrl, error: message }, 'Failed to write URL to DB');
+
+    log.info(
+      { websiteId: website.id, url: normalizedUrl, status: updatedPage.status },
+      'URL scraped, marked as ready_for_indexing, and indexing triggered'
+    );
+
+    return {
+      success: true,
+      websiteId: website.id,
+      url: normalizedUrl,
+      status: updatedPage.status === 'ready_for_indexing' ? 'processing' : updatedPage.status as 'processing' | 'active' | 'error',
+      message: 'URL successfully scraped and indexing has been triggered. The page will be indexed shortly.',
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    log.error({ url: normalizedUrl, error: message }, 'Failed to index URL');
+
+    await supabase.updateProcessJob(processJob.id, {
+      completed_at: new Date().toISOString(),
+      errors: [...errors, { url: normalizedUrl, error: message, timestamp: new Date().toISOString() }],
+      status: 'failed',
+    });
+
     return {
       success: false,
-      websiteId,
+      websiteId: website.id,
       url: normalizedUrl,
       status: 'error',
       error: message,
+      message: `Failed to index URL: ${message}`,
     };
   }
 }
@@ -335,4 +475,5 @@ export async function reindexUrl(url: string): Promise<ReindexResult> {
     message: 'Content updated and re-indexed',
   };
 }
+
 

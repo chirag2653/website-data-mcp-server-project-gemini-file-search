@@ -417,12 +417,25 @@ export async function searchWithFileSearch(
   log.info({ storeName, question: question.slice(0, 100) }, 'Executing search');
 
   try {
+    // System instruction to guide the model's behavior
+    // This ensures the model answers based only on the provided content and cites sources
+    const systemInstruction = `You are a helpful assistant that answers questions based on the provided website content.
+
+Guidelines:
+- Answer questions using ONLY the information from the provided website content
+- Be accurate, concise, and well-formatted
+- Always cite specific sources when referencing information
+- If the content doesn't contain relevant information, say so clearly
+- Format your answers with proper structure (bullet points, paragraphs, etc.)
+- Do not make up information that isn't in the provided content`;
+
     // Follow the exact API structure from official docs:
     // https://ai.google.dev/gemini-api/docs/file-search#javascript
     const response = await genai.models.generateContent({
       model: config.gemini.model,
       contents: question,
       config: {
+        systemInstruction,
         tools: [
           {
             fileSearch: {
@@ -435,12 +448,19 @@ export async function searchWithFileSearch(
     });
 
     // Extract answer text
+    // NOTE: Gemini generates the answer FIRST using ALL retrieved chunks
+    // The answer is generated BEFORE we extract citations, so filtering citations
+    // does NOT affect which chunks were used to generate the answer
     const answer = response.text ?? '';
 
     // Extract citations from grounding metadata
     // According to Gemini API docs: https://ai.google.dev/gemini-api/docs/file-search
     // Citations are provided via groundingMetadata.groundingChunks
     // Each chunk contains retrievedContext with the document content used
+    // - retrievedContext.text: The actual text content that was used in the answer
+    // - retrievedContext.title: The document title
+    // - retrievedContext.uri: May or may not exist (known limitation)
+    // - URLs are often embedded in the text content (markdown)
     const sources = extractCitations(response);
 
     // Log chunk statistics for monitoring
@@ -694,6 +714,54 @@ async function waitForOperation(
 }
 
 /**
+ * Check if a URL is an image URL
+ */
+function isImageUrl(url: string): boolean {
+  const imageExtensions = /\.(jpg|jpeg|png|gif|webp|svg|bmp|ico)(\?|#|$)/i;
+  const imageCdnPatterns = [
+    /optimole\.com/i,
+    /cloudinary\.com/i,
+    /imgix\.net/i,
+    /images\.unsplash\.com/i,
+    /cdn\./i,
+  ];
+  
+  // Check for Next.js image optimization URLs
+  if (url.includes('/_next/image') || url.includes('_next/static')) {
+    return true;
+  }
+  
+  // Check for image file extensions
+  if (imageExtensions.test(url)) {
+    return true;
+  }
+  
+  // Check for image CDN patterns
+  for (const pattern of imageCdnPatterns) {
+    if (pattern.test(url)) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+/**
+ * Extract all URLs from text, filtering out image URLs
+ */
+function extractPageUrls(text: string): string[] {
+  const urlPattern = /https?:\/\/[^\s\)]+/g;
+  const matches = text.match(urlPattern) || [];
+  
+  return matches
+    .map(url => {
+      // Clean up the URL (remove trailing fragments like #content or closing parentheses)
+      return url.split('#')[0].split(')')[0].trim();
+    })
+    .filter(url => !isImageUrl(url)); // Filter out image URLs
+}
+
+/**
  * Extract citations from response
  */
 function extractCitations(response: {
@@ -719,7 +787,8 @@ function extractCitations(response: {
     return [];
   }
 
-  const seen = new Set<string>();
+  const seenUrls = new Set<string>();
+  const seenTitles = new Set<string>();
   const sources: GeminiSearchResponse['sources'] = [];
 
   // Extract citations from grounding chunks
@@ -733,29 +802,77 @@ function extractCitations(response: {
   for (const chunk of metadata.groundingChunks) {
     const retrievedContext = chunk.retrievedContext as any; // SDK returns more fields than typed
     
+    // Title comes from displayName we set during upload
+    const title = retrievedContext?.title || (chunk as any).title || '';
+    
     // Try to get URI from different possible locations (may not exist)
-    let uri = retrievedContext?.uri 
+    let uris: string[] = [];
+    
+    // First, try direct URI fields
+    const directUri = retrievedContext?.uri 
       || retrievedContext?.sourceUri
       || retrievedContext?.documentUri
       || (chunk as any).uri;
     
-    // If no URI found directly, extract from text (URLs are embedded in markdown)
-    // This is the standard approach - Gemini doesn't provide URI in retrievedContext
-    // The URL is embedded in the markdown content we uploaded
-    if (!uri && retrievedContext?.text) {
-      const urlMatch = retrievedContext.text.match(/https?:\/\/[^\s\)]+/);
-      if (urlMatch) {
-        // Clean up the URL (remove trailing fragments like #content or closing parentheses)
-        uri = urlMatch[0].split('#')[0].split(')')[0].trim();
+    if (directUri) {
+      uris.push(directUri);
+    }
+    
+    // Extract ALL URLs from text (not just the first one)
+    if (retrievedContext?.text) {
+      // Extract all page URLs (non-image URLs) from text
+      const pageUrls = extractPageUrls(retrievedContext.text);
+      uris.push(...pageUrls);
+      
+      // If no page URLs found, fallback to any URL (even image URLs)
+      if (pageUrls.length === 0) {
+        const urlPattern = /https?:\/\/[^\s\)]+/g;
+        const allUrls = retrievedContext.text.match(urlPattern) || [];
+        uris.push(...allUrls.map(url => {
+          // Clean up the URL
+          return url.split('#')[0].split(')')[0].trim();
+        }));
       }
     }
     
-    // Title comes from displayName we set during upload
-    const title = retrievedContext?.title || (chunk as any).title;
-
-    if (uri && !seen.has(uri)) {
-      seen.add(uri);
-      sources.push({ uri, title });
+    // Filter out image URLs if we have a meaningful title
+    // IMPORTANT: This filtering only affects citations, NOT the answer
+    // The answer was already generated using this chunk's text content
+    // We're just choosing not to show image URLs as citations
+    const filteredUris = uris.filter(uri => {
+      if (isImageUrl(uri) && title && title.length > 10) {
+        return false; // Skip image URLs when we have a document title
+      }
+      return true;
+    });
+    
+    // Remove duplicates from this chunk's URLs
+    const uniqueUris = Array.from(new Set(filteredUris));
+    
+    // Add citations for each unique URI from this chunk
+    for (const uri of uniqueUris) {
+      if (uri && !seenUrls.has(uri)) {
+        seenUrls.add(uri);
+        sources.push({ uri, title: title || undefined });
+      }
+    }
+    
+    // If no URI found but we have a unique title, add it as a citation
+    // This helps capture sources even when URL extraction fails
+    if (uniqueUris.length === 0 && title && title.length > 10 && !seenTitles.has(title)) {
+      seenTitles.add(title);
+      // Try to extract URL from title if it looks like a URL
+      const titleUrlMatch = title.match(/https?:\/\/[^\s]+/);
+      if (titleUrlMatch) {
+        const titleUrl = titleUrlMatch[0].split('#')[0].split(')')[0].trim();
+        if (!seenUrls.has(titleUrl)) {
+          seenUrls.add(titleUrl);
+          sources.push({ uri: titleUrl, title });
+        }
+      } else {
+        // Add citation with title only (no URL)
+        sources.push({ uri: undefined, title });
+      }
     }
   }
 

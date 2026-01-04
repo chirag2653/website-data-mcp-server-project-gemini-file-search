@@ -18,7 +18,8 @@
     "list:websites": "tsx scripts/list-websites.ts",
     "test:ingestion": "tsx scripts/test-ingestion.ts",
     "test:indexing": "tsx scripts/test-indexing.ts",
-    "test:sync": "tsx scripts/test-sync.ts"
+    "test:sync": "tsx scripts/test-sync.ts",
+    "test:individual-url": "tsx scripts/test-individual-url.ts"
   },
   "devDependencies": {
     "tsx": "^4.19.0"

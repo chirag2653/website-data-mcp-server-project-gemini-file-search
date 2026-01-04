@@ -18,25 +18,34 @@ This is **not just an MCP server**—it's a modular system of core business logi
 
 **Purpose**: Initial website crawl and content discovery. Discovers all pages on a website, scrapes their content, and stores it in the database ready for indexing.
 
-**Workflow**: Takes a seed URL and optional display name. Creates a Gemini File Search store, discovers all URLs via FireCrawl's `/map` endpoint, batch scrapes all pages using FireCrawl's batch API, validates and stores complete markdown content in Supabase with status `ready_for_indexing`, and creates a website record. Discards incomplete scrapes (missing markdown, empty content) to ensure data quality.
+**Workflow**: Takes a seed URL and optional display name. Validates input using Zod, normalizes and extracts base domain (handles www vs non-www), checks if website already exists (by base domain), handles stuck ingestion jobs with recovery logic, creates Gemini File Search store if new website, creates website record in Supabase, discovers all URLs via FireCrawl's `/map` endpoint, filters URLs to match base domain, batch scrapes all pages using FireCrawl's batch API with progress tracking, validates and stores only complete scrapes (non-empty markdown) in Supabase with status `ready_for_indexing`, discards incomplete scrapes (missing markdown, empty content) to ensure data quality, and creates process job for tracking. Does NOT automatically trigger indexing—pages are stored ready for indexing to be triggered separately.
 
 **Input**: `seedUrl` (string), `displayName` (optional string)
 
-**Processing**: FireCrawl URL discovery → Batch scraping → Content validation → Database storage
+**Processing**: Input validation → Domain normalization → Website existence check → Gemini store creation → FireCrawl URL discovery → Batch scraping → Content validation → Database storage
 
-**Output**: Returns `IngestionResult` with website ID, domain, Gemini store ID, pages discovered count, pages scraped count, and any errors encountered.
+**Output**: Returns `IngestionResult` with website ID, domain, Gemini store ID, pages discovered count, pages scraped count, ingestion job ID, and any errors encountered.
+
+**Test Script**: `scripts/test-ingestion.ts` - See "Test Ingestion Module" section below.
 
 ### 2. Indexing Module (`packages/core/src/services/indexing.ts`)
 
-**Purpose**: Uploads stored markdown content to Gemini File Search for semantic search. Separated from ingestion to allow retries without re-scraping.
+**Purpose**: Uploads stored markdown content to Gemini File Search for semantic search. Separated from ingestion to allow retries without re-scraping. Handles three types of operations: new page indexing, re-indexing changed pages, and deletion of missing pages.
 
-**Workflow**: Takes a website ID and optional job metadata. Reads all pages with status `ready_for_indexing` from Supabase, ensures the Gemini File Search store exists (creates if needed), uploads markdown content to Gemini File Search as documents, updates page status to `active` after successful upload, and stores Gemini file IDs for future reference. Handles retries gracefully using stored markdown.
+**Workflow**: Takes a website ID and optional job metadata. Processes pages in three categories:
+- **New pages** (`ready_for_indexing`): Uploads markdown to Gemini File Search, verifies document state (ACTIVE/PROCESSING/FAILED), and updates status to `active` when document is fully processed
+- **Updated pages** (`ready_for_re_indexing`): Deletes old Gemini document first, then uploads new content, verifies state, and updates to `active`
+- **Deletion pages** (`ready_for_deletion`): Deletes document from Gemini and marks page as `deleted` in database
+
+Processes pages in batches of 5 (parallel uploads) with incremental database updates after each batch. Limits to 200 pages per run for memory management. Verifies document state from Gemini API (ACTIVE = ready, PENDING = processing, FAILED = retry) and only marks as `active` when document is fully processed. Handles rate limiting with automatic retries.
 
 **Input**: `websiteId` (string), `options` (optional: `ingestionJobId`, `syncJobId`, `autoCreateStore`)
 
-**Processing**: Database query → Gemini store verification → Markdown upload → Status updates
+**Processing**: Database query → Gemini store verification → Batch upload (5 parallel) → Document state verification → Incremental status updates
 
-**Output**: Returns `IndexingResult` with indexing job ID, website ID, pages indexed count, and any errors encountered.
+**Output**: Returns `IndexingResult` with indexing job ID, website ID, pages indexed count (only ACTIVE documents), and any errors encountered.
+
+**Test Script**: `scripts/test-indexing.ts` - See "Test Indexing Module" section below.
 
 ### 3. Sync Module (`packages/core/src/services/sync.ts`)
 
@@ -171,58 +180,71 @@ Existing URL (changed) → ready_for_re_indexing → (indexing) → active
 Missing URL → missing_count++ → (if >= threshold) → ready_for_deletion → (indexing) → deleted
 ```
 
-#### Testing
-
-**Command**: `pnpm test:sync <websiteId>`
-
-**Example**:
-```bash
-pnpm test:sync 4aaa8a34-4198-463c-9b88-c44985660dd6
-```
-
-**What it does**: Verifies website exists, checks existing pages, runs sync service, displays results including rich metadata statistics, and shows what happened (new URLs, changed pages, missing URLs, deletions).
+**Test Script**: `scripts/test-sync.ts` - See "Test Sync Module" section below.
 
 ### 4. Search Module (`packages/core/src/services/search.ts`)
 
 **Purpose**: Semantic search queries using Gemini File Search. Ask questions, check for existing content, and find keyword mentions across indexed websites.
 
-**Workflow**: Takes a question and website domain. Validates and normalizes the domain input, looks up the website by base domain (handles www vs non-www), verifies the website has a Gemini File Search store, executes semantic query using Gemini File Search API, generates grounded answers with source citations, and returns formatted results with answer text and source URLs.
+**Workflow**: Takes a question and website URL/domain. Validates input using Zod (question max 5000 chars, URL must be valid), normalizes domain to base domain (handles www vs non-www, extracts domain from URLs), looks up website by base domain (same logic as ingestion), verifies website exists and has Gemini File Search store, executes semantic query using Gemini File Search API, generates grounded answers with source citations, cleans and formats answer text, and returns formatted results with answer text and source URLs with titles and snippets.
 
-**Input**: `question` (string), `websiteDomain` (string - can be URL, domain, or domain with path)
+**Input**: `question` (string, max 5000 chars), `websiteUrl` (string - can be full URL, domain, or domain with path)
 
-**Processing**: Input validation → Domain normalization → Website lookup → Gemini File Search query → Answer generation
+**Processing**: Input validation → Domain normalization → Website lookup → Gemini File Search query → Answer generation → Result formatting
 
-**Output**: Returns `SearchResult` with answer text, source citations (URLs, titles, snippets), and metadata.
+**Output**: Returns `SearchResult` with answer text (cleaned), source citations (URLs, titles, snippets), website ID, and metadata.
+
+**Test Script**: `scripts/test-search.ts` - See "Test Search Module" section below.
 
 ### 5. Individual URL Module (`packages/core/src/services/individual-url.ts`)
 
-**Purpose**: Single URL operations for existing websites. Handles indexing new URLs, checking status, and reindexing existing URLs—similar to Google Search Console's "add individual URL" feature.
+**Purpose**: Single URL indexing for existing websites. Handles indexing individual URLs by automatically finding the website by domain—similar to Google Search Console's "Request Indexing" feature. Just provide a URL and it handles the rest.
 
-**Workflow**: Takes a website ID and URL. Validates the URL belongs to the website's exact domain, verifies the website has existing pages (requirement for individual URL operations), scrapes the URL using FireCrawl's direct scrape API, validates content completeness, stores the page in database with status `processing`, triggers indexing for the single URL, and updates status to `active` after successful indexing. Also provides status checking and reindexing functions.
+**Workflow**: Takes just a URL (no website ID needed). Automatically extracts the base domain from the URL, normalizes domain (handles www vs non-www), finds the website by base domain, validates the website exists and has pages, validates URL domain matches website domain, checks if the URL already exists:
+- If already `active`: Returns early with success message
+- If `ready_for_indexing`: Triggers indexing and checks status
+- Otherwise: Re-scrapes the URL
 
-**Input**: `websiteId` (string), `url` (string)
+For new URLs: Creates process job for tracking, scrapes URL using `batchScrapeAndProcess` (same as ingestion/sync for consistency), stores the page in database with status `ready_for_indexing`, automatically triggers indexing service, and checks final status after indexing completes. Also provides status checking (`getUrlStatus`) and reindexing (`reindexUrl`) functions.
 
-**Processing**: Domain validation → URL scraping → Content validation → Database storage → Indexing trigger
+**Input**: `url` (string) - Just the URL, no website ID needed
 
-**Output**: Returns `IndividualUrlResult` with success status, website ID, URL, current status, and any error messages.
+**Processing**: Domain extraction → Website lookup → Validation → Status check → Batch scraping (if needed) → Database storage → Indexing trigger → Status verification
+
+**Output**: Returns `IndividualUrlResult` with success status, website ID (auto-discovered), URL, current status (`active`, `processing`, or `error`), helpful error messages, suggestions (e.g., to run ingestion if website doesn't exist), and optional `canAutoIngest` flag.
+
+**Key Features**:
+- **Automatic website discovery**: No need to know the website ID—just provide a URL
+- **Smart validation**: Checks if URL already exists and returns early if already active
+- **Consistent scraping**: Uses same `batchScrapeAndProcess` function as ingestion/sync
+- **Auto-indexing**: Automatically triggers indexing service after scraping
+- **Helpful UX**: Provides clear error messages and suggestions if website doesn't exist
+- **Status checking**: `getUrlStatus()` function to check current status of any URL
+- **Reindexing**: `reindexUrl()` function to force re-scrape and re-index an existing URL
+
+**Test Script**: `scripts/test-individual-url.ts` - See "Test Individual URL Module" section below.
 
 ### 6. Cleanup Module (`packages/core/src/services/cleanup.ts`)
 
 **Purpose**: Utility module for cleaning up Gemini File Search stores and documents. Useful for testing, resetting, or removing old data.
 
-**Workflow**: Takes cleanup options (delete stores flag, store filter pattern). Lists all Gemini File Search stores (optionally filtered), deletes all documents from each store, optionally deletes the stores themselves, handles rate limiting and retries with exponential backoff, and provides detailed cleanup reports.
+**Workflow**: Takes cleanup options (delete stores flag, store filter pattern). Lists all Gemini File Search stores (optionally filtered by pattern), deletes all documents from each store (handles pagination for large stores), optionally deletes the stores themselves, handles rate limiting and retries with exponential backoff, and provides detailed cleanup reports with per-store statistics.
 
 **Input**: `options` (object: `deleteStores` boolean, `storeFilter` optional string pattern)
 
-**Processing**: Store enumeration → Document deletion → Optional store deletion → Error handling
+**Processing**: Store enumeration → Document deletion (with pagination) → Optional store deletion → Error handling with retries
 
-**Output**: Returns `CleanupResult` with stores deleted count, documents deleted count, per-store details, and any errors encountered.
+**Output**: Returns `CleanupResult` with stores processed count, stores deleted count, documents deleted count, per-store details, and any errors encountered.
+
+**Note**: This module does not have a dedicated test script, but can be tested via the cleanup commands in package.json (`pnpm cleanup` and `pnpm cleanup:docs`).
 
 ## Testing Core Modules
 
-Each core module can be tested directly using CLI tools in the `scripts/` directory. These tools provide a command-line interface for testing modules without running the MCP server or web application.
+Each core module has a dedicated test script in the `scripts/` directory. These CLI tools allow you to test modules directly without running the MCP server or web application, making development and debugging faster and easier.
 
 ### Test Ingestion Module
+
+**Script**: `scripts/test-ingestion.ts`
 
 **Command**: `pnpm test:ingestion <url> [displayName]`
 
@@ -231,11 +253,20 @@ Each core module can be tested directly using CLI tools in the `scripts/` direct
 pnpm test:ingestion https://www.peersignal.org/ "PeerSignal"
 ```
 
-**What it does**: Validates the input URL and optional display name, calls the ingestion module to create a Gemini File Search store, discovers all URLs via FireCrawl, batch scrapes all pages, stores pages in the database with status `ready_for_indexing`, and outputs the website ID, domain, Gemini store ID, pages discovered count, pages scraped count, and any errors.
+**What it does**: 
+- Validates the input URL and optional display name
+- Calls the ingestion module to create a Gemini File Search store
+- Discovers all URLs via FireCrawl `/map` endpoint
+- Batch scrapes all pages using FireCrawl batch API
+- Stores only complete scrapes (non-empty markdown) in database with status `ready_for_indexing`
+- Discards incomplete scrapes (ensures data quality)
+- Outputs the website ID, domain, Gemini store ID, pages discovered count, pages scraped count, ingestion job ID, and any errors
 
-**Output**: Website ID (for use in subsequent indexing), domain, Gemini Store ID, pages discovered, pages scraped, and error list.
+**Output**: Website ID (for use in subsequent indexing), domain, Gemini Store ID, pages discovered, pages scraped, ingestion job ID, and error list.
 
 ### Test Indexing Module
+
+**Script**: `scripts/test-indexing.ts`
 
 **Command**: `pnpm test:indexing <websiteId>`
 
@@ -244,13 +275,25 @@ pnpm test:ingestion https://www.peersignal.org/ "PeerSignal"
 pnpm test:indexing a0001d33-25ee-41b5-b79a-0dbac05296fb
 ```
 
-**Prerequisites**: Website must exist in database and have pages with status `ready_for_indexing` and `markdown_content`.
+**Prerequisites**: Website must exist in database and have pages with status `ready_for_indexing`, `ready_for_re_indexing`, or `ready_for_deletion` with `markdown_content`.
 
-**What it does**: Verifies the website exists in the database, checks for pages ready for indexing, calls the indexing module to upload markdown content to Gemini File Search, updates page status to `active` after successful upload, and outputs the indexing job ID, pages indexed count, and any errors.
+**What it does**: 
+- Verifies the website exists in the database
+- Checks for pages ready for processing (new, re-index, deletion)
+- Shows page status breakdown
+- Calls the indexing module to:
+  - Upload new pages to Gemini File Search
+  - Re-index changed pages (deletes old document first)
+  - Delete missing pages from Gemini
+- Verifies document state from Gemini API (ACTIVE/PROCESSING/FAILED)
+- Updates page status to `active` only when document is fully processed
+- Outputs the indexing job ID, pages indexed count (only ACTIVE documents), and any errors
 
-**Output**: Indexing job ID, website ID, pages indexed count, and error list.
+**Output**: Indexing job ID, website ID, pages indexed count (only fully processed ACTIVE documents), and error list.
 
 ### Test Sync Module
+
+**Script**: `scripts/test-sync.ts`
 
 **Command**: `pnpm test:sync <websiteId>`
 
@@ -261,11 +304,31 @@ pnpm test:sync 4aaa8a34-4198-463c-9b88-c44985660dd6
 
 **Prerequisites**: Website must exist in database and have been ingested (must have at least one page and a Gemini store).
 
-**What it does**: Verifies website exists and has prerequisites, checks existing pages and their statuses, runs sync service to discover new URLs, detect content changes, and handle missing URLs, displays comprehensive results including rich metadata statistics (URL categorization, content changes, similarity statistics, error tracking, missing count statistics, status changes), and shows what happened (new URLs discovered, pages updated, pages deleted).
+**What it does**: 
+- Verifies website exists and has prerequisites
+- Checks existing pages and their statuses
+- Runs sync service which:
+  - Retries incomplete pages from previous syncs (self-healing)
+  - Discovers current URLs via FireCrawl `/map`
+  - Categorizes URLs (new, existing, missing)
+  - Batch scrapes new URLs
+  - Checks existing URLs for content changes (similarity-based)
+  - Increments missing_count for missing URLs
+  - Marks URLs for deletion if missing_count >= threshold
+  - Triggers indexing pipeline automatically
+- Displays comprehensive results including rich metadata statistics:
+  - URL categorization (new, existing, missing counts)
+  - Content changes (unchanged, changed, empty content counts)
+  - Similarity statistics (average, min, max, threshold)
+  - Error tracking (HTTP 404, 410 counts)
+  - Missing count statistics (average, maximum, threshold)
+  - Status changes (ready_for_indexing, ready_for_re_indexing, ready_for_deletion)
 
 **Output**: Sync job ID, URLs discovered, URLs updated, URLs deleted, URLs errored, detailed statistics (categorization, content changes, similarity, errors, missing count, status changes), and error list.
 
 ### Test Search Module
+
+**Script**: `scripts/test-search.ts`
 
 **Command**: `pnpm test:search <question> <websiteDomain>`
 
@@ -274,11 +337,45 @@ pnpm test:sync 4aaa8a34-4198-463c-9b88-c44985660dd6
 pnpm test:search "What is PeerSignal about?" "peersignal.org"
 ```
 
-**Prerequisites**: Website must exist in database and have indexed pages (run indexing first).
+**Prerequisites**: Website must exist in database and have indexed pages with status `active` (run ingestion and indexing first).
 
-**What it does**: Validates the question and website domain input, calls the search module to execute a semantic query using Gemini File Search, formats and displays the answer with source citations, and outputs the answer text, source URLs, titles, and snippets.
+**What it does**: 
+- Validates the question (max 5000 chars) and website URL/domain input using Zod
+- Normalizes domain to base domain (handles www vs non-www)
+- Looks up website by base domain
+- Verifies website has Gemini File Search store
+- Calls the search module to execute a semantic query using Gemini File Search
+- Formats and displays the cleaned answer with source citations
+- Outputs the answer text, source URLs, titles, snippets, and website ID
 
-**Output**: Answer text, source citations (URLs, titles, snippets), and metadata.
+**Output**: Answer text (cleaned), source citations (URLs, titles, snippets), website ID, and metadata.
+
+### Test Individual URL Module
+
+**Script**: `scripts/test-individual-url.ts`
+
+**Command**: `pnpm test:individual-url <url>`
+
+**Example**:
+```bash
+pnpm test:individual-url https://example.com/new-page
+```
+
+**Prerequisites**: Website must exist in database and have at least one page (must have been ingested first).
+
+**What it does**: 
+- Automatically extracts base domain from URL
+- Finds the website by base domain (no website ID needed)
+- Validates the website exists and has pages
+- Validates URL domain matches website domain
+- Checks if URL already exists:
+  - If already `active`: Returns early with success message
+  - If `ready_for_indexing`: Triggers indexing and checks status
+  - Otherwise: Re-scrapes the URL
+- For new URLs: Creates process job, scrapes URL using batch scraping (same as ingestion/sync), marks page as `ready_for_indexing`, triggers indexing service automatically, checks final status after indexing
+- Displays detailed results including page title, status, content hash, Gemini file ID, and helpful messages or suggestions
+
+**Output**: Success status, website ID (auto-discovered), URL, current status (`active`, `processing`, or `error`), page details (title, status, content hash, Gemini file ID), helpful messages, and suggestions (e.g., to run ingestion if website doesn't exist).
 
 ### List Websites
 
@@ -391,6 +488,7 @@ This project uses a **monorepo architecture** with clear separation between core
 │   ├── test-indexing.ts         # Test indexing module
 │   ├── test-sync.ts             # Test sync module
 │   ├── test-search.ts           # Test search module
+│   ├── test-individual-url.ts   # Test individual URL module
 │   ├── cleanup-gemini.ts        # Test cleanup module
 │   └── list-websites.ts         # Utility to list websites
 │
@@ -435,6 +533,9 @@ pnpm test:sync abc123-def456-...
 
 # 4. Test search (use domain from step 1)
 pnpm test:search "What is this website about?" "example.com"
+
+# 5. Test individual URL indexing (just provide a URL)
+pnpm test:individual-url https://example.com/new-page
 ```
 
 ## MCP Tools (Interface Layer)
@@ -446,7 +547,8 @@ When using the MCP server interface, these tools are available:
 - **`site_ask`** - Ask questions about website content (uses Search Module)
 - **`site_check_existing_content`** - Check if content already exists (uses Search Module)
 - **`site_find_mentions`** - Find pages mentioning keywords (uses Search Module)
-- **`site_reindex_url`** - Re-index a single URL (uses Individual URL Module)
+- **`site_request_indexing`** - Request indexing for a single URL (uses Individual URL Module) - Just provide a URL, automatically finds website by domain
+- **`site_reindex_url`** - Force re-scrape and re-index an existing URL (uses Individual URL Module)
 - **`site_get_url_status`** - Get status of a specific URL (uses Individual URL Module)
 - **`site_list`** - List all indexed websites
 

@@ -38,6 +38,10 @@ export const SiteReindexSchema = z.object({
   url: z.string().describe('The URL to reindex'),
 });
 
+export const SiteRequestIndexingSchema = z.object({
+  url: z.string().describe('The URL to request indexing for (e.g., "https://example.com/page")'),
+});
+
 export const SiteIngestSchema = z.object({
   seedUrl: z.string().describe('The homepage or starting URL to ingest'),
   displayName: z.string().optional().describe('Human-readable name for the website'),
@@ -122,6 +126,21 @@ export const toolDefinitions = [
         url: {
           type: 'string',
           description: 'The URL to reindex',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'site_request_indexing',
+    description:
+      'Request indexing for a specific URL (Google Search Console style). Automatically finds the website by domain and indexes the URL. Use this when you know a URL exists on a website but it\'s not yet indexed.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        url: {
+          type: 'string',
+          description: 'The URL to request indexing for (e.g., "https://example.com/page")',
         },
       },
       required: ['url'],
@@ -239,6 +258,22 @@ export async function handleToolCall(
         const parsed = SiteReindexSchema.parse(args);
         const response = await individualUrl.reindexUrl(parsed.url);
         result = response;
+        break;
+      }
+
+      case 'site_request_indexing': {
+        const parsed = SiteRequestIndexingSchema.parse(args);
+        const response = await individualUrl.indexIndividualUrl(parsed.url);
+        result = {
+          success: response.success,
+          websiteId: response.websiteId,
+          url: response.url,
+          status: response.status,
+          message: response.message,
+          suggestion: response.suggestion,
+          canAutoIngest: response.canAutoIngest,
+          error: response.error,
+        };
         break;
       }
 

@@ -13,62 +13,109 @@ import type { SearchResult } from '../types/index.js';
 const log = loggers.search;
 
 /**
+ * Clean and format answer text for better presentation
+ * Removes excessive formatting, normalizes whitespace, and ensures clean output
+ */
+function cleanAnswer(answer: string | null | undefined): string {
+  // Handle null/undefined/empty cases
+  if (!answer || typeof answer !== 'string') {
+    return '';
+  }
+  
+  // Remove excessive newlines (more than 2 consecutive)
+  let cleaned = answer.replace(/\n{3,}/g, '\n\n');
+  
+  // Remove excessive spaces
+  cleaned = cleaned.replace(/[ \t]{3,}/g, ' ');
+  
+  // Trim each line
+  cleaned = cleaned
+    .split('\n')
+    .map(line => line.trim())
+    .join('\n');
+  
+  // Remove leading/trailing whitespace
+  cleaned = cleaned.trim();
+  
+  return cleaned;
+}
+
+/**
  * Ask a question and get an answer grounded in website content
  *
  * This is the main search function that uses Gemini File Search
  * to find relevant content and generate a grounded answer.
  * 
- * @param question - The question to ask about the website content
- * @param websiteDomain - The website domain (can be URL, domain, or domain with extra text)
- *                        Examples: "example.com", "https://www.example.com", "www.example.com/path"
- * @returns Search result with answer and sources
+ * @param question - The question to ask about the website content (max 5000 chars)
+ * @param websiteUrl - The website URL (can be full URL, domain, or domain with path)
+ *                     Examples: "https://example.com", "example.com", "www.example.com/path"
+ * @returns Search result with clean answer and citations
  */
 export async function askQuestion(
   question: string,
-  websiteDomain: string
+  websiteUrl: string
 ): Promise<SearchResult> {
   // ========================================================================
-  // STEP 1: INPUT VALIDATION
+  // STEP 1: INPUT VALIDATION WITH ZOD
   // ========================================================================
   try {
-    // Validate question
+    // Validate question - any string with length constraints
     const questionSchema = z
-      .string()
+      .string({
+        required_error: 'Question is required',
+        invalid_type_error: 'Question must be a string',
+      })
       .min(1, 'Question cannot be empty')
       .max(5000, 'Question must be 5000 characters or less')
       .trim();
     
     question = questionSchema.parse(question);
     
-    // Validate website domain
-    const domainSchema = z
-      .string()
-      .min(1, 'Website domain is required')
+    // Validate URL - must contain a valid URL or domain
+    const urlSchema = z
+      .string({
+        required_error: 'Website URL is required',
+        invalid_type_error: 'Website URL must be a string',
+      })
+      .min(1, 'Website URL cannot be empty')
       .refine(
         (input) => {
-          const domainPattern = /([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}/i;
-          return domainPattern.test(input);
+          // Check if it contains a valid URL pattern
+          // Accepts: http://example.com, https://example.com, example.com, www.example.com
+          const urlPattern = /^(https?:\/\/)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(\/.*)?$/i;
+          return urlPattern.test(input.trim());
         },
-        { message: 'Input must contain a valid domain (e.g., example.com or https://www.example.com)' }
+        { message: 'Please provide a valid URL (e.g., https://example.com or example.com)' }
       );
     
-    websiteDomain = domainSchema.parse(websiteDomain);
+    websiteUrl = urlSchema.parse(websiteUrl);
   } catch (validationError) {
+    if (validationError instanceof z.ZodError) {
+      const firstError = validationError.errors[0];
+      const message = firstError?.message || 'Invalid input';
+      log.error({ question, websiteUrl, error: message }, 'Input validation failed');
+      throw new Error(message);
+    }
     const message = validationError instanceof Error ? validationError.message : 'Invalid input';
-    log.error({ question, websiteDomain, error: message }, 'Input validation failed');
-    throw new Error(`Invalid search input: ${message}`);
+    log.error({ question, websiteUrl, error: message }, 'Input validation failed');
+    throw new Error(message);
   }
 
   // ========================================================================
-  // STEP 2: NORMALIZE DOMAIN (Extract clean domain from input)
+  // STEP 2: NORMALIZE DOMAIN (Extract root domain from URL)
   // ========================================================================
   // Extract domain from URL/string, then get base domain (removes www)
   // This matches ingestion logic: www.example.com and example.com resolve to same website
-  const extractedDomain = normalizeDomain(websiteDomain);
+  const extractedDomain = normalizeDomain(websiteUrl);
   const baseDomain = extractBaseDomain(extractedDomain);
   
+  // Validate that we got a valid domain after normalization
+  if (!baseDomain || baseDomain.trim().length === 0) {
+    throw new Error('Could not extract a valid domain from the provided URL. Please provide a valid URL (e.g., https://example.com or example.com)');
+  }
+  
   log.info({ 
-    originalDomain: websiteDomain, 
+    originalUrl: websiteUrl, 
     extractedDomain,
     baseDomain,
     question: question.slice(0, 100) 
@@ -82,16 +129,18 @@ export async function askQuestion(
   
   if (!website) {
     throw new Error(
-      `Website not found for domain: ${baseDomain}. ` +
-      `The domain "${websiteDomain}" has not been indexed yet. ` +
-      `Would you like to index it? Please run ingestion first.`
+      `This domain (${baseDomain}) has never been indexed. ` +
+      `Would you like to index and ingest this domain?`
     );
   }
 
+  // ========================================================================
+  // STEP 4: CHECK FILE STORE EXISTS
+  // ========================================================================
   if (!website.gemini_store_id) {
     throw new Error(
-      `Website "${baseDomain}" has no Gemini File Search store. ` +
-      `Please run indexing to create the store.`
+      `This domain (${baseDomain}) has been ingested but not yet indexed. ` +
+      `Would you like to index and ingest this domain?`
     );
   }
 
@@ -101,36 +150,57 @@ export async function askQuestion(
       domain: website.domain,
       storeId: website.gemini_store_id 
     },
-    'Website found, executing search'
+    'Website found with file store, executing search'
   );
 
   // ========================================================================
-  // STEP 4: EXECUTE SEARCH
+  // STEP 5: EXECUTE SEARCH
   // ========================================================================
   const response = await gemini.searchWithFileSearch(
     website.gemini_store_id,
     question
   );
 
-  // Map sources to include URL info
-  const sources = response.sources.map((source) => ({
+  // ========================================================================
+  // STEP 6: FORMAT RESPONSE
+  // ========================================================================
+  // Clean and format the answer for better presentation
+  const cleanedAnswer = cleanAnswer(response.answer);
+  
+  // Handle empty answer case
+  if (!cleanedAnswer || cleanedAnswer.trim().length === 0) {
+    log.warn(
+      { websiteId: website.id, domain: website.domain },
+      'Empty answer received from Gemini'
+    );
+  }
+
+  // Map sources to include URL info (citations)
+  const citations = (response.sources || []).map((source) => ({
     url: source.uri ?? '',
     title: source.title ?? '',
-    snippet: undefined,
+    snippet: undefined, // Can be populated later if needed
   }));
+  
+  if (citations.length === 0) {
+    log.warn(
+      { websiteId: website.id, domain: website.domain },
+      'No citations found in search response'
+    );
+  }
 
   log.info(
     { 
       websiteId: website.id, 
       domain: website.domain,
-      sourceCount: sources.length 
+      citationCount: citations.length 
     },
-    'Question answered'
+    'Question answered successfully'
   );
 
   return {
-    answer: response.answer,
-    sources,
+    answer: cleanedAnswer,
+    sources: citations,
     websiteId: website.id,
   };
 }
@@ -194,24 +264,53 @@ export async function searchWithFilter(
     websiteDomain: string;
   }
 ): Promise<SearchResult> {
+  // Validate question input (same validation as askQuestion)
+  try {
+    const questionSchema = z
+      .string({
+        required_error: 'Question is required',
+        invalid_type_error: 'Question must be a string',
+      })
+      .min(1, 'Question cannot be empty')
+      .max(5000, 'Question must be 5000 characters or less')
+      .trim();
+    
+    question = questionSchema.parse(question);
+  } catch (validationError) {
+    if (validationError instanceof z.ZodError) {
+      const firstError = validationError.errors[0];
+      const message = firstError?.message || 'Invalid question';
+      log.error({ question, error: message }, 'Question validation failed');
+      throw new Error(message);
+    }
+    throw validationError;
+  }
+  
   log.info({ question: question.slice(0, 100), filter }, 'Filtered search');
 
   // Normalize domain to base domain (same as ingestion)
   const extractedDomain = normalizeDomain(filter.websiteDomain);
   const baseDomain = extractBaseDomain(extractedDomain);
+  
+  // Validate that we got a valid domain after normalization
+  if (!baseDomain || baseDomain.trim().length === 0) {
+    throw new Error('Could not extract a valid domain from the provided URL. Please provide a valid URL (e.g., https://example.com or example.com)');
+  }
 
   // Get website by base domain
   const website = await supabase.getWebsiteByDomain(baseDomain);
   if (!website) {
     throw new Error(
-      `Website not found for domain: ${baseDomain}. ` +
-      `The domain "${filter.websiteDomain}" has not been indexed yet. ` +
-      `Would you like to index it? Please run ingestion first.`
+      `This domain (${baseDomain}) has never been indexed. ` +
+      `Would you like to index and ingest this domain?`
     );
   }
 
   if (!website.gemini_store_id) {
-    throw new Error('Website has no Gemini File Search store');
+    throw new Error(
+      `This domain (${baseDomain}) has been ingested but not yet indexed. ` +
+      `Would you like to index and ingest this domain?`
+    );
   }
 
   // Build metadata filter if path prefix provided
@@ -228,9 +327,20 @@ export async function searchWithFilter(
     { metadataFilter }
   );
 
+  // Clean and format the answer
+  const cleanedAnswer = cleanAnswer(response.answer);
+  
+  // Handle empty answer case
+  if (!cleanedAnswer || cleanedAnswer.trim().length === 0) {
+    log.warn(
+      { websiteId: website.id, domain: website.domain },
+      'Empty answer received from Gemini in filtered search'
+    );
+  }
+
   return {
-    answer: response.answer,
-    sources: response.sources.map((s) => ({
+    answer: cleanedAnswer,
+    sources: (response.sources || []).map((s) => ({
       url: s.uri ?? '',
       title: s.title ?? '',
     })),
