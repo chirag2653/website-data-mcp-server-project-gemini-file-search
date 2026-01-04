@@ -40,15 +40,147 @@ This is **not just an MCP server**—it's a modular system of core business logi
 
 ### 3. Sync Module (`packages/core/src/services/sync.ts`)
 
-**Purpose**: Incremental updates and refresh of website content. Discovers new pages, detects changed content, and safely handles deletions using a threshold-based approach.
+**Purpose**: Incremental updates and refresh of website content. Discovers new pages, detects changed content using similarity-based comparison, and safely handles deletions using a threshold-based approach to prevent false deletions from temporary issues.
 
-**Workflow**: Takes a website ID. Re-runs FireCrawl `/map` to get current URLs, compares with existing database records to categorize URLs (NEW, CHANGED, UNCHANGED, MISSING), scrapes new and changed pages, uses content hashes to detect changes, updates unchanged pages with fresh timestamps, increments missing count for URLs not found, and only deletes URLs after 3 consecutive misses (prevents false deletions from temporary issues). Automatically triggers indexing for new/changed pages.
+#### Overview
 
-**Input**: `websiteId` (string)
+The sync module performs incremental updates to keep website content fresh. It runs after initial ingestion and compares the current state of a website (via FireCrawl's `/map` endpoint) with what's stored in the database to identify:
+- **New URLs**: Pages that exist on the website but not in the database
+- **Existing URLs**: Pages that exist in both (checked for content changes)
+- **Missing URLs**: Pages that exist in the database but not found in the current website map
 
-**Processing**: URL discovery → Categorization → Change detection → Selective scraping → Safe deletion → Indexing trigger
+#### How It Works
 
-**Output**: Returns `SyncResult` with sync job ID, URLs discovered, URLs updated, URLs deleted, and any errors encountered.
+**Step 0: Self-Healing (Retry Logic)**
+- Checks for pages with status `pending`, `processing`, or `error` from previous syncs
+- Pages with markdown content are set to `ready_for_indexing` or `ready_for_re_indexing` (based on whether they have a `gemini_file_id`)
+- Pages without markdown are re-scraped using FireCrawl batch API
+
+**Step 1: URL Discovery**
+- Re-runs FireCrawl `/map` endpoint to get current URLs from the website
+- Filters URLs to match the website's exact domain
+- Normalizes URLs (removes trailing slashes, normalizes protocols)
+
+**Step 2: URL Categorization**
+- Compares current URLs with database records to create three categories:
+  - **New URLs**: In FireCrawl map but not in database → Need to be scraped and indexed
+  - **Existing URLs**: In both map and database → Need to be checked for content changes
+  - **Missing URLs**: In database but not in map → Missing count incremented
+
+**Step 3: Handle New URLs**
+- Uses shared `batchScrapeAndProcess` function (same logic as ingestion)
+- Batch scrapes all new URLs using FireCrawl batch API
+- Validates scraped content (must have non-empty markdown)
+- Stores pages in database with status `ready_for_indexing`
+- Automatically triggers indexing pipeline (async)
+
+**Step 4: Handle Existing URLs (Content Change Detection)**
+- Batch scrapes existing URLs to get current content
+- For each existing page:
+  - **404/410 Errors**: Increments `missing_count` (treats as missing, not deleted)
+  - **Empty Content**: Resets `missing_count` to 0, updates `last_seen` timestamp
+  - **Content Comparison**: Uses similarity-based detection (not just hash comparison)
+    - Compares new markdown with existing markdown using Sørensen–Dice coefficient
+    - Default similarity threshold: 95% (configurable via `SIMILARITY_THRESHOLD`)
+    - **Unchanged** (similarity ≥ threshold):
+      - Updates `content_hash`, `last_scraped`, `last_seen` timestamps
+      - Resets `missing_count` to 0
+      - Keeps existing `gemini_file_id` (no re-indexing needed)
+    - **Changed** (similarity < threshold):
+      - Sets status to `ready_for_re_indexing`
+      - Updates `markdown_content`, `content_hash`, and metadata
+      - Clears `gemini_file_id` (indexing service will delete old document and upload new one)
+      - Resets `missing_count` to 0
+
+**Step 5: Handle Missing URLs**
+- URLs found in database but not in FireCrawl map
+- Increments `missing_count` for each missing URL
+- Does NOT delete immediately (prevents false deletions from temporary issues)
+
+**Step 6: Handle Deletions (Threshold-Based)**
+- Only marks URLs for deletion if `missing_count >= threshold` (default: 3)
+- This means a URL must be missing for 3 consecutive syncs before deletion
+- Sets status to `ready_for_deletion` (indexing service handles actual Gemini deletion)
+- Prevents false deletions from:
+  - Temporary network issues
+  - Site maintenance
+  - FireCrawl API issues
+  - Temporary redirects
+
+**Step 7: Rich Metadata Tracking**
+- Stores comprehensive statistics in process job metadata:
+  - **Categorization**: New, existing, missing URL counts
+  - **Content Changes**: Unchanged, changed, empty content counts
+  - **Similarity Statistics**: Average, min, max similarity percentages, pages compared
+  - **Error Tracking**: HTTP 404, 410 counts, total errors
+  - **Missing Count Statistics**: Average, maximum missing_count, deletion threshold
+  - **Status Changes**: Pages set to `ready_for_indexing`, `ready_for_re_indexing`, `ready_for_deletion`
+
+**Step 8: Auto-Trigger Indexing**
+- Automatically triggers indexing pipeline (async, fire-and-forget)
+- Indexing service picks up pages with:
+  - `ready_for_indexing` (new pages)
+  - `ready_for_re_indexing` (changed pages - deletes old Gemini document first)
+  - `ready_for_deletion` (missing pages - deletes from Gemini)
+
+#### Key Features
+
+1. **Similarity-Based Change Detection**: Uses string similarity (Sørensen–Dice) instead of exact hash matching to avoid false positives from minor changes (e.g., one character difference)
+
+2. **Threshold-Based Deletion**: Requires multiple consecutive misses before deletion to prevent false deletions from temporary issues
+
+3. **Self-Healing**: Automatically retries failed/incomplete pages from previous syncs
+
+4. **Rich Metadata**: Tracks comprehensive statistics for monitoring and analytics
+
+5. **Centralized Gemini Operations**: All Gemini deletions happen in indexing service, not sync service
+
+#### Configuration
+
+Environment variables:
+- `SIMILARITY_THRESHOLD` (default: `0.95`): Content similarity threshold (0-1). Pages with similarity ≥ threshold are considered unchanged.
+- `DELETION_THRESHOLD` (default: `3`): Number of consecutive syncs a URL must be missing before deletion.
+
+#### Input
+
+- `websiteId` (string): UUID of the website to sync
+
+**Prerequisites**:
+- Website must exist in database
+- Website must have at least one page (must have been ingested first)
+- Website must have a Gemini store ID (created during ingestion)
+
+#### Output
+
+Returns `SyncResult` with:
+- `syncLogId`: Process job ID for tracking
+- `urlsDiscovered`: Number of new URLs found
+- `urlsUpdated`: Number of pages updated (new + changed)
+- `urlsDeleted`: Number of pages marked for deletion
+- `urlsErrored`: Number of errors encountered
+- `errors`: Array of error details
+
+**Process Job Metadata** includes rich statistics (see Step 7 above).
+
+#### Status Flow
+
+```
+New URL → ready_for_indexing → (indexing) → active
+Existing URL (unchanged) → (no status change, keep active)
+Existing URL (changed) → ready_for_re_indexing → (indexing) → active
+Missing URL → missing_count++ → (if >= threshold) → ready_for_deletion → (indexing) → deleted
+```
+
+#### Testing
+
+**Command**: `pnpm test:sync <websiteId>`
+
+**Example**:
+```bash
+pnpm test:sync 4aaa8a34-4198-463c-9b88-c44985660dd6
+```
+
+**What it does**: Verifies website exists, checks existing pages, runs sync service, displays results including rich metadata statistics, and shows what happened (new URLs, changed pages, missing URLs, deletions).
 
 ### 4. Search Module (`packages/core/src/services/search.ts`)
 
@@ -117,6 +249,21 @@ pnpm test:indexing a0001d33-25ee-41b5-b79a-0dbac05296fb
 **What it does**: Verifies the website exists in the database, checks for pages ready for indexing, calls the indexing module to upload markdown content to Gemini File Search, updates page status to `active` after successful upload, and outputs the indexing job ID, pages indexed count, and any errors.
 
 **Output**: Indexing job ID, website ID, pages indexed count, and error list.
+
+### Test Sync Module
+
+**Command**: `pnpm test:sync <websiteId>`
+
+**Example**:
+```bash
+pnpm test:sync 4aaa8a34-4198-463c-9b88-c44985660dd6
+```
+
+**Prerequisites**: Website must exist in database and have been ingested (must have at least one page and a Gemini store).
+
+**What it does**: Verifies website exists and has prerequisites, checks existing pages and their statuses, runs sync service to discover new URLs, detect content changes, and handle missing URLs, displays comprehensive results including rich metadata statistics (URL categorization, content changes, similarity statistics, error tracking, missing count statistics, status changes), and shows what happened (new URLs discovered, pages updated, pages deleted).
+
+**Output**: Sync job ID, URLs discovered, URLs updated, URLs deleted, URLs errored, detailed statistics (categorization, content changes, similarity, errors, missing count, status changes), and error list.
 
 ### Test Search Module
 
@@ -242,6 +389,7 @@ This project uses a **monorepo architecture** with clear separation between core
 ├── scripts/                      # CLI testing tools for core modules
 │   ├── test-ingestion.ts        # Test ingestion module
 │   ├── test-indexing.ts         # Test indexing module
+│   ├── test-sync.ts             # Test sync module
 │   ├── test-search.ts           # Test search module
 │   ├── cleanup-gemini.ts        # Test cleanup module
 │   └── list-websites.ts         # Utility to list websites
@@ -282,7 +430,10 @@ pnpm test:ingestion https://example.com "Example Website"
 # 2. Test indexing (use website ID from step 1)
 pnpm test:indexing abc123-def456-...
 
-# 3. Test search (use domain from step 1)
+# 3. Test sync (use website ID from step 1, after some time has passed)
+pnpm test:sync abc123-def456-...
+
+# 4. Test search (use domain from step 1)
 pnpm test:search "What is this website about?" "example.com"
 ```
 

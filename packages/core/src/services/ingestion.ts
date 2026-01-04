@@ -19,24 +19,149 @@ import type {
 const log = loggers.ingestion;
 
 /**
+ * Batch scrape URLs and process results
+ * 
+ * Shared function for both ingestion and sync flows.
+ * Handles: starting batch scrape, tracking progress, waiting for completion, and processing results.
+ * 
+ * @param urls - URLs to scrape
+ * @param websiteId - The website ID
+ * @param processJobId - The process job ID (ingestion or sync) for tracking
+ * @param errors - Array to append errors to (mutated in place)
+ * @param options - Optional parameters
+ * @param options.ingestionJobId - Ingestion job ID for lineage tracking
+ * @param options.syncJobId - Sync job ID for lineage tracking
+ * @param options.trackProgress - Whether to update progress in DB (default: false)
+ * @param options.batchJobIds - Array to append batch job IDs to (for tracking)
+ * @returns Object with batchJobId, pagesWritten, and scrapeResult
+ */
+export async function batchScrapeAndProcess(
+  urls: string[],
+  websiteId: string,
+  processJobId: string,
+  errors: SyncError[],
+  options?: {
+    ingestionJobId?: string;
+    syncJobId?: string;
+    trackProgress?: boolean;
+    batchJobIds?: string[];
+  }
+): Promise<{
+  batchJobId: string | null;
+  pagesWritten: number;
+  scrapeResult: Awaited<ReturnType<typeof firecrawl.batchScrapeWait>>;
+}> {
+  if (urls.length === 0) {
+    return { batchJobId: null, pagesWritten: 0, scrapeResult: { success: true, completed: 0, total: 0 } };
+  }
+
+  log.info({ urlCount: urls.length, processJobId }, 'Starting batch scrape');
+
+  // Start batch scrape
+  const batchStart = await firecrawl.batchScrapeStart(urls);
+  if (!batchStart.success) {
+    const errorMessage = batchStart.error || 'Batch scrape start failed';
+    log.error({ error: errorMessage, processJobId }, 'Failed to start batch scrape');
+    errors.push(...urls.map(url => ({ url, error: errorMessage, timestamp: new Date().toISOString() })));
+    return { batchJobId: null, pagesWritten: 0, scrapeResult: { success: false, error: errorMessage } };
+  }
+
+  const batchJobId = batchStart.jobId;
+  log.info({ batchJobId, urlCount: urls.length, processJobId }, 'Batch scrape job started');
+
+  // Track batch job ID
+  if (options?.batchJobIds) {
+    options.batchJobIds.push(batchJobId);
+  }
+
+  // Store batch job ID in process job for crash recovery and UI polling
+  await supabase.updateProcessJob(processJobId, {
+    firecrawl_batch_ids: [batchJobId],
+  });
+  log.debug({ batchJobId, processJobId }, 'Batch job ID stored in process_job');
+
+  // Wait for batch scrape to complete
+  // Optionally track progress in database for UI polling
+  let lastProgressUpdate = Date.now();
+  const scrapeResult = await firecrawl.batchScrapeWait(batchJobId, {
+    pollIntervalMs: 5000,
+    maxWaitMs: 600000, // 10 minutes
+    onProgress: options?.trackProgress
+      ? async (completed, total) => {
+          log.debug({ completed, total, processJobId }, 'Scrape progress');
+
+          // Update progress in database every 30 seconds for UI polling
+          const now = Date.now();
+          if (now - lastProgressUpdate >= 30000) {
+            lastProgressUpdate = now;
+            const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
+            await supabase.updateProcessJob(processJobId, {
+              metadata: {
+                progress: {
+                  completed,
+                  total,
+                  percentage,
+                },
+              },
+            });
+            log.info(
+              { processJobId, completed, total, percentage },
+              'Updated scrape progress in database'
+            );
+          }
+        }
+      : undefined,
+  });
+
+  if (!scrapeResult.success || !scrapeResult.data) {
+    log.error({ error: scrapeResult.error, batchJobId, processJobId }, 'Batch scrape failed');
+    return { batchJobId, pagesWritten: 0, scrapeResult };
+  }
+
+  log.info(
+    { completed: scrapeResult.completed, total: scrapeResult.total, batchJobId, processJobId },
+    'Batch scrape complete'
+  );
+
+  // Process scraped results - only write complete scrapes
+  const pagesWritten = await processScrapedPages(
+    scrapeResult.data ?? [],
+    websiteId,
+    batchJobId,
+    errors,
+    {
+      ingestionJobId: options?.ingestionJobId,
+      syncJobId: options?.syncJobId,
+    }
+  );
+
+  return { batchJobId, pagesWritten, scrapeResult };
+}
+
+/**
  * Process scraped page data and write to database
  * 
  * This shared function handles validation, data preparation, and atomic writes
- * for both main ingestion flow and recovery flow.
+ * for both ingestion and sync flows. Can be used by both services.
  * 
  * @param scrapedData - Array of scraped page data from FireCrawl
  * @param websiteId - The website ID to associate pages with
- * @param ingestionJobId - The ingestion job ID for lineage tracking
  * @param batchJobId - The FireCrawl batch job ID
  * @param errors - Array to append errors to (mutated in place)
+ * @param options - Optional parameters for lineage tracking
+ * @param options.ingestionJobId - The ingestion job ID (for ingestion flow)
+ * @param options.syncJobId - The sync job ID (for sync flow)
  * @returns Number of pages successfully written to database
  */
-async function processScrapedPages(
+export async function processScrapedPages(
   scrapedData: Array<any>,
   websiteId: string,
-  ingestionJobId: string,
   batchJobId: string,
-  errors: SyncError[]
+  errors: SyncError[],
+  options?: {
+    ingestionJobId?: string;
+    syncJobId?: string;
+  }
 ): Promise<number> {
   let pagesWritten = 0;
   const now = new Date().toISOString();
@@ -102,7 +227,8 @@ async function processScrapedPages(
           og_image: pageData.metadata?.ogImage,
           language: pageData.metadata?.language,
         },
-        created_by_ingestion_id: ingestionJobId,
+        ...(options?.ingestionJobId ? { created_by_ingestion_id: options.ingestionJobId } : {}),
+        ...(options?.syncJobId ? { created_by_sync_id: options.syncJobId } : {}),
         firecrawl_batch_id: batchJobId,
       });
 
@@ -453,72 +579,21 @@ export async function ingestWebsite(
       throw new Error('No URLs discovered during mapping');
     }
 
-    // Step 5: Start batch scrape with job ID tracking
-    log.info({ urlCount: discoveredUrls.length }, 'Starting batch scrape');
-    
-    const batchStart = await firecrawl.batchScrapeStart(discoveredUrls);
-    if (!batchStart.success) {
-      throw new Error(`Batch scrape start failed: ${batchStart.error}`);
-    }
-    
-    const batchJobId = batchStart.jobId;
-    log.info({ batchJobId }, 'Batch scrape job started');
-
-    // Store batch job ID immediately for crash recovery and UI polling
-    await supabase.updateProcessJob(ingestionJob.id, {
-      firecrawl_batch_ids: [batchJobId],
-    });
-    log.info({ batchJobId, ingestionJobId: ingestionJob.id }, 'Batch job ID stored in process_job');
-
-    // Wait for batch scrape to complete (long-running, up to 10 minutes)
-    // Update progress in database every 30 seconds for UI polling
-    let lastProgressUpdate = Date.now();
-    const scrapeResult = await firecrawl.batchScrapeWait(batchJobId, {
-      pollIntervalMs: 5000,
-      maxWaitMs: 600000, // 10 minutes
-      onProgress: async (completed, total) => {
-        log.debug({ completed, total }, 'Scrape progress');
-        
-        // Update progress in database every 30 seconds for UI polling
-        const now = Date.now();
-        if (now - lastProgressUpdate >= 30000) {
-          lastProgressUpdate = now;
-          const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
-          await supabase.updateProcessJob(ingestionJob.id, {
-            metadata: {
-              progress: {
-                completed,
-                total,
-                percentage,
-              },
-            },
-          });
-          log.info(
-            { ingestionJobId: ingestionJob.id, completed, total, percentage },
-            'Updated ingestion progress in database'
-          );
-        }
-      },
-    });
-
-    if (!scrapeResult.success || !scrapeResult.data) {
-      throw new Error(`Batch scrape failed: ${scrapeResult.error || 'Unknown error'}`);
-    }
-
-    log.info(
-      { completed: scrapeResult.completed, total: scrapeResult.total },
-      'Batch scrape complete'
-    );
-
-    // Step 6: Process scraped results - only write complete scrapes
-    const scrapedData = scrapeResult.data ?? [];
-    const pagesWritten = await processScrapedPages(
-      scrapedData,
+    // Step 5: Batch scrape and process URLs (using shared function)
+    const { batchJobId, pagesWritten, scrapeResult } = await batchScrapeAndProcess(
+      discoveredUrls,
       website.id,
       ingestionJob.id,
-      batchJobId,
-      errors
+      errors,
+      {
+        ingestionJobId: ingestionJob.id,
+        trackProgress: true, // Enable progress tracking for ingestion
+      }
     );
+
+    if (!batchJobId || !scrapeResult.success) {
+      throw new Error(`Batch scrape failed: ${scrapeResult.error || 'Unknown error'}`);
+    }
 
     log.info(
       {
@@ -718,9 +793,9 @@ export async function recoverIngestionJob(ingestionJobId: string): Promise<{
     const pagesWritten = await processScrapedPages(
       scrapedData,
       website.id,
-      ingestionJobId,
       batchJobId,
-      errors
+      errors,
+      { ingestionJobId }
     );
 
     // Mark job as completed

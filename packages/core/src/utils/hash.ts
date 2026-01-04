@@ -3,6 +3,7 @@
  */
 
 import { createHash } from 'crypto';
+import { compareTwoStrings } from 'string-similarity';
 
 /**
  * Normalize content for consistent hashing
@@ -53,4 +54,40 @@ export function hasContentChanged(
   const newHash = computeContentHash(newContent);
   const changed = existingHash !== newHash;
   return { changed, newHash };
+}
+
+/**
+ * Check if content has changed significantly based on similarity comparison
+ * Uses Dice coefficient (Sørensen–Dice) to calculate similarity between 0 and 1
+ * 
+ * @param newContent - New markdown content
+ * @param existingContent - Existing markdown content (null if page doesn't exist)
+ * @param similarityThreshold - Minimum similarity to consider unchanged (default: 0.95 = 95%)
+ * @returns Object with changed status, new hash, and similarity score (0-1)
+ */
+export function hasContentChangedSignificantly(
+  newContent: string,
+  existingContent: string | null,
+  similarityThreshold: number = 0.95
+): { changed: boolean; newHash: string; similarity: number } {
+  const newHash = computeContentHash(newContent);
+  
+  // If no existing content, it's definitely changed
+  if (!existingContent) {
+    return { changed: true, newHash, similarity: 0 };
+  }
+  
+  // Fast path: if hashes match, content is identical (after normalization)
+  const existingHash = computeContentHash(existingContent);
+  if (newHash === existingHash) {
+    return { changed: false, newHash, similarity: 1.0 };
+  }
+  
+  // Hash differs - calculate similarity using Dice coefficient
+  // This compares the actual content, not just normalized hashes
+  // Returns a value between 0 (completely different) and 1 (identical)
+  const similarity = compareTwoStrings(existingContent, newContent);
+  const changed = similarity < similarityThreshold;
+  
+  return { changed, newHash, similarity };
 }

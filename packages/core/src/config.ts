@@ -22,6 +22,7 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
   SYNC_INTERVAL_HOURS: z.coerce.number().int().positive().default(12),
   DELETION_THRESHOLD: z.coerce.number().int().positive().default(3),
+  SIMILARITY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.95), // 95% similarity = unchanged
 });
 
 type EnvConfig = z.infer<typeof envSchema>;
@@ -57,6 +58,7 @@ function loadConfig(): AppConfig {
     sync: {
       intervalHours: env.SYNC_INTERVAL_HOURS,
       deletionThreshold: env.DELETION_THRESHOLD,
+      similarityThreshold: env.SIMILARITY_THRESHOLD,
     },
     logging: {
       level: env.LOG_LEVEL,

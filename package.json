@@ -17,7 +17,8 @@
     "cleanup:docs": "tsx scripts/cleanup-gemini.ts --docs-only",
     "list:websites": "tsx scripts/list-websites.ts",
     "test:ingestion": "tsx scripts/test-ingestion.ts",
-    "test:indexing": "tsx scripts/test-indexing.ts"
+    "test:indexing": "tsx scripts/test-indexing.ts",
+    "test:sync": "tsx scripts/test-sync.ts"
   },
   "devDependencies": {
     "tsx": "^4.19.0"

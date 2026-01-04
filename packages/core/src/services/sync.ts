@@ -5,10 +5,10 @@
 
 import * as supabase from '../clients/supabase.js';
 import * as firecrawl from '../clients/firecrawl.js';
-import * as gemini from '../clients/gemini.js';
 import * as indexingService from './indexing.js';
-import { computeContentHash, hasContentChanged } from '../utils/hash.js';
-import { extractPath, normalizeUrl, filterUrlsByDomain } from '../utils/url.js';
+import { batchScrapeAndProcess } from './ingestion.js';
+import { computeContentHash, hasContentChangedSignificantly } from '../utils/hash.js';
+import { normalizeUrl, filterUrlsByDomain } from '../utils/url.js';
 import { config } from '../config.js';
 import { loggers } from '../utils/logger.js';
 import type { SyncResult, SyncError, Page } from '../types/index.js';
@@ -62,6 +62,19 @@ export async function syncWebsite(websiteId: string): Promise<SyncResult> {
   let urlsDiscovered = 0;
   let urlsUpdated = 0;
   let urlsDeleted = 0;
+  
+  // Rich metadata tracking
+  let newUrlsCount = 0;
+  let existingUrlsCount = 0;
+  let missingUrlsCount = 0;
+  let unchangedUrlsCount = 0;
+  let changedUrlsCount = 0;
+  let error404Count = 0;
+  let error410Count = 0;
+  let emptyContentCount = 0;
+  const similarityStats: number[] = []; // Track similarity percentages for changed pages
+  const missingCountStats: number[] = []; // Track missing_count values
+  
   const now = new Date().toISOString(); // Define once at start
 
   try {
@@ -85,11 +98,14 @@ export async function syncWebsite(websiteId: string): Promise<SyncResult> {
       const pagesWithMarkdown = retryPages.filter((p) => p.markdown_content && p.content_hash);
       const pagesToReScrape = retryPages.filter((p) => !p.markdown_content || !p.content_hash);
 
-      // Ensure pages with markdown have status='processing' for indexing pipeline
+      // Ensure pages with markdown have correct status for indexing pipeline
+      // - If has gemini_file_id: needs re-indexing (status='ready_for_re_indexing')
+      // - If no gemini_file_id: needs first-time indexing (status='ready_for_indexing')
       for (const page of pagesWithMarkdown) {
-        if (page.status !== 'processing') {
+        const correctStatus = page.gemini_file_id ? 'ready_for_re_indexing' : 'ready_for_indexing';
+        if (page.status !== correctStatus) {
           await supabase.updatePage(page.id, {
-            status: 'processing',
+            status: correctStatus,
             error_message: null,
           });
         }
@@ -200,6 +216,11 @@ export async function syncWebsite(websiteId: string): Promise<SyncResult> {
       .filter((p) => p.status !== 'deleted' && !currentUrls.includes(p.url))
       .map((p) => p.url);
     
+    // Track categorization counts
+    newUrlsCount = newUrls.length;
+    existingUrlsCount = existingUrls.length;
+    missingUrlsCount = missingUrls.length;
+    
     // Log status breakdown for existing URLs
     const existingPagesStatusBreakdown = existingUrls
       .map(url => existingPageMap.get(url))
@@ -221,98 +242,28 @@ export async function syncWebsite(websiteId: string): Promise<SyncResult> {
 
     urlsDiscovered = newUrls.length;
 
-    // Step 3: Handle new URLs
+    // Step 3: Handle new URLs (using shared batch scrape function)
     if (newUrls.length > 0) {
       log.info({ count: newUrls.length }, 'Processing new URLs');
 
-      // Start batch scrape for new URLs (don't write to DB yet - only write complete scrapes)
-      const batchStart = await firecrawl.batchScrapeStart(newUrls);
-      if (!batchStart.success) {
-        log.error({ error: batchStart.error }, 'Failed to start batch scrape for new URLs');
-        errors.push(...newUrls.map(url => ({ url, error: batchStart.error || 'Batch scrape start failed', timestamp: now })));
-      } else {
-        const batchJobId = batchStart.jobId;
-        firecrawlBatchIds.push(batchJobId);
-        log.info({ batchJobId, urlCount: newUrls.length }, 'Batch scrape started for new URLs');
-
-        // Wait for batch scrape to complete
-        const scrapeResult = await firecrawl.batchScrapeWait(batchJobId, {
-          pollIntervalMs: 5000,
-          maxWaitMs: 600000, // 10 minutes
-        });
-
-        if (scrapeResult.success && scrapeResult.data) {
-          for (const pageData of scrapeResult.data) {
-            if (!pageData) continue;
-            const url = pageData.metadata?.sourceURL;
-
-            // Validate completeness - skip if missing required data
-            if (!url) {
-              log.warn({ pageData }, 'Page missing sourceURL, skipping (discarded)');
-              continue; // Discard - don't write to DB
-            }
-
-            // ========================================================================
-            // VALIDATION PHASE: Ensure we have ALL required data before writing
-            // ========================================================================
-            if (!pageData.markdown || typeof pageData.markdown !== 'string') {
-              log.warn({ url }, 'Page missing markdown or invalid type, skipping (discarded)');
-              errors.push({ url, error: 'Missing or invalid markdown content', timestamp: now });
-              continue; // Discard - don't write to DB
-            }
-
-            const trimmedMarkdown = pageData.markdown.trim();
-            if (trimmedMarkdown.length === 0) {
-              log.warn({ url }, 'Empty markdown content after trim, skipping (discarded)');
-              errors.push({ url, error: 'Empty content after scraping', timestamp: now });
-              continue; // Discard - don't write to DB
-            }
-
-            // ========================================================================
-            // DATA PREPARATION: Prepare all data for single atomic write
-            // ========================================================================
-            const contentHash = computeContentHash(pageData.markdown);
-            const path = extractPath(url);
-            const httpStatusCode = pageData.metadata?.statusCode ?? null;
-
-            // ========================================================================
-            // SINGLE ATOMIC WRITE: Write complete data in one operation
-            // ========================================================================
-            // Only call upsertPage when we have ALL required data ready
-            // No verification needed - if validation passed, write will succeed with complete data
-            try {
-              await supabase.upsertPage({
-                website_id: websiteId,
-                url,
-                path,
-                title: pageData.metadata?.title,
-                status: 'processing', // Not 'active' yet - indexing will promote it
-                content_hash: contentHash,
-                markdown_content: pageData.markdown, // Complete markdown content
-                http_status_code: httpStatusCode,
-                firecrawl_scrape_count: 1,
-                last_seen: now,
-                metadata: {
-                  title: pageData.metadata?.title,
-                  description: pageData.metadata?.description,
-                  og_image: pageData.metadata?.ogImage,
-                  language: pageData.metadata?.language,
-                },
-                created_by_sync_id: syncJob.id,
-                firecrawl_batch_id: batchJobId,
-              });
-
-              urlsUpdated++;
-            } catch (dbError) {
-              const message = dbError instanceof Error ? dbError.message : 'Unknown error';
-              log.error({ url, error: message }, 'Failed to write page to DB');
-              errors.push({ url, error: message, timestamp: now });
-              // Continue - don't fail entire process for one URL
-            }
-          }
-        } else {
-          log.error({ error: scrapeResult.error }, 'Batch scrape failed for new URLs');
+      // Use shared batchScrapeAndProcess function (same logic as ingestion)
+      // This ensures consistency and reduces code duplication
+      const { batchJobId, pagesWritten, scrapeResult } = await batchScrapeAndProcess(
+        newUrls,
+        websiteId,
+        syncJob.id,
+        errors,
+        {
+          syncJobId: syncJob.id,
+          trackProgress: false, // Sync doesn't need progress tracking (can enable if needed)
+          batchJobIds: firecrawlBatchIds, // Track batch IDs for sync job
         }
+      );
+
+      if (batchJobId && scrapeResult.success) {
+        urlsUpdated += pagesWritten;
+      } else if (!scrapeResult.success) {
+        log.error({ error: scrapeResult.error }, 'Batch scrape failed for new URLs');
       }
     }
 
@@ -360,6 +311,13 @@ export async function syncWebsite(websiteId: string): Promise<SyncResult> {
               if (statusCode === 404 || statusCode === 410) {
                 log.info({ url, statusCode }, 'URL returned 404/410, incrementing missing_count');
                 
+                // Track error counts
+                if (statusCode === 404) {
+                  error404Count++;
+                } else if (statusCode === 410) {
+                  error410Count++;
+                }
+                
                 // Increment missing_count instead of immediate deletion
                 // This will be handled by the threshold-based deletion logic later
                 await supabase.incrementMissingCount(websiteId, [url]);
@@ -369,6 +327,7 @@ export async function syncWebsite(websiteId: string): Promise<SyncResult> {
               // Skip if empty content (but URL exists, so reset missing_count)
               if (!pageData.markdown || pageData.markdown.trim().length === 0) {
                 // URL exists but empty - reset missing_count, update last_seen
+                emptyContentCount++;
                 await supabase.updatePage(page.id, {
                   last_seen: now,
                   missing_count: 0,
@@ -376,43 +335,69 @@ export async function syncWebsite(websiteId: string): Promise<SyncResult> {
                 continue;
               }
 
-              // Compare hash to detect changes
-              const { changed, newHash } = hasContentChanged(pageData.markdown, page.content_hash);
+              // Compare content using similarity-based detection
+              // This prevents false positives from trivial changes (e.g., one character difference)
+              const similarityThreshold = config.sync.similarityThreshold;
+              const { changed, newHash, similarity } = hasContentChangedSignificantly(
+                pageData.markdown,
+                page.markdown_content, // Compare with actual markdown content, not just hash
+                similarityThreshold
+              );
 
               if (!changed) {
-                // UNCHANGED: Just update timestamps and increment scrape count
+                // UNCHANGED or MINOR CHANGE: Content is similar enough (>= threshold)
+                // Just update hash, timestamps, and scrape count
+                // No re-indexing needed - keep existing gemini_file_id
+                unchangedUrlsCount++;
+                similarityStats.push(similarity); // Track similarity for unchanged pages
+                
+                // Track missing_count before reset
+                if (page.missing_count > 0) {
+                  missingCountStats.push(page.missing_count);
+                }
+                
+                log.debug(
+                  { url, similarity: (similarity * 100).toFixed(2) + '%' },
+                  'Content similar, skipping re-index'
+                );
+
                 await supabase.updatePage(page.id, {
+                  content_hash: newHash, // Update hash even if content is similar
                   last_scraped: now,
                   last_seen: now,
+                  missing_count: 0, // Reset missing_count - page was found again
                   firecrawl_scrape_count: (page.firecrawl_scrape_count ?? 0) + 1,
                   http_status_code: pageData.metadata.statusCode,
                 });
                 continue;
               }
 
-              // CHANGED: Content hash differs - update DB with new content
-              log.debug({ url }, 'Content changed, updating');
+              // CHANGED: Content differs significantly (< threshold similarity)
+              // Requires re-indexing - update markdown, hash, and set status
+              // Note: We do NOT delete from Gemini here - indexing service will handle it
+              changedUrlsCount++;
+              similarityStats.push(similarity); // Track similarity for changed pages
+              
+              log.info(
+                { url, similarity: (similarity * 100).toFixed(2) + '%', threshold: (similarityThreshold * 100).toFixed(2) + '%' },
+                'Content changed significantly, requires re-indexing'
+              );
 
-              // Delete old document from Gemini (if exists) - indexing will upload new one
-              if (page.gemini_file_id) {
-                try {
-                  await gemini.deleteFileFromStore(website.gemini_store_id, page.gemini_file_id);
-                } catch (error) {
-                  // Ignore 404 - document may already be gone
-                  log.warn({ url, error }, 'Failed to delete old document (may already be gone)');
-                }
-              }
-
-              // Save new markdown and hash, set status to 'processing'
-              // Indexing pipeline will upload to Gemini and set to 'active'
+              // Save new markdown and hash, set status to 'ready_for_re_indexing'
+              // Indexing pipeline will:
+              // 1. Delete old document from Gemini (using existing gemini_file_id)
+              // 2. Upload new content to Gemini
+              // 3. Update page with new gemini_file_id and set to 'active'
               await supabase.updatePage(page.id, {
-                status: 'processing',
+                status: 'ready_for_re_indexing', // Explicit: requires re-indexing (delete old + upload new)
                 title: pageData.metadata.title,
                 content_hash: newHash,
                 markdown_content: pageData.markdown,
                 http_status_code: pageData.metadata.statusCode,
                 firecrawl_scrape_count: (page.firecrawl_scrape_count ?? 0) + 1,
                 last_seen: now,
+                last_scraped: now, // Update last_scraped when content changes
+                missing_count: 0, // Reset missing_count - page was found again
                 gemini_file_id: undefined, // Clear old file ID - indexing will set new one
                 gemini_file_name: undefined,
                 error_message: null,
@@ -448,45 +433,104 @@ export async function syncWebsite(websiteId: string): Promise<SyncResult> {
     // This could be temporary (site down, network issue, etc.), so we use threshold-based deletion
     if (missingUrls.length > 0) {
       log.info({ count: missingUrls.length }, 'URLs missing from map, incrementing missing_count');
+      
+      // Get missing_count values before incrementing for stats
+      const missingPages = existingPages.filter(p => missingUrls.includes(p.url));
+      missingPages.forEach(page => {
+        if (page.missing_count !== null && page.missing_count !== undefined) {
+          missingCountStats.push(page.missing_count);
+        }
+      });
+      
       await supabase.incrementMissingCount(websiteId, missingUrls);
     }
 
     // Step 6: Handle deletions (URLs past threshold)
-    // Only delete URLs that have been missing for >= threshold consecutive syncs
+    // Only mark for deletion URLs that have been missing for >= threshold consecutive syncs
     // This prevents false deletions due to temporary issues
+    // Note: We do NOT delete from Gemini here - indexing service will handle it
     const threshold = config.sync.deletionThreshold;
     const pagesToDelete = await supabase.getPagesPastDeletionThreshold(websiteId, threshold);
 
     if (pagesToDelete.length > 0) {
       log.info(
         { count: pagesToDelete.length, threshold },
-        'Pages past deletion threshold, marking as deleted'
+        'Pages past deletion threshold, marking as ready_for_deletion'
       );
 
-      for (const page of pagesToDelete) {
-        try {
-          if (page.gemini_file_id) {
-            await gemini.deleteFileFromStore(website.gemini_store_id, page.gemini_file_id);
-          }
-        } catch (error) {
-          log.warn({ pageId: page.id, error }, 'Failed to delete from Gemini');
-        }
-      }
-
-      await supabase.markPagesDeleted(pagesToDelete.map((p) => p.id));
+      // Set status to 'ready_for_deletion' - indexing service will:
+      // 1. Delete document from Gemini (using gemini_file_id)
+      // 2. Mark page as 'deleted' in database
+      await supabase.updatePagesStatus(
+        pagesToDelete.map((p) => p.id),
+        'ready_for_deletion'
+      );
+      
+      // Track count for reporting (actual deletion happens in indexing)
       urlsDeleted = pagesToDelete.length;
     }
 
-    // Step 7: Update sync process job
+    // Step 7: Update sync process job with rich metadata
+    const avgSimilarity = similarityStats.length > 0
+      ? similarityStats.reduce((a, b) => a + b, 0) / similarityStats.length
+      : null;
+    const minSimilarity = similarityStats.length > 0 ? Math.min(...similarityStats) : null;
+    const maxSimilarity = similarityStats.length > 0 ? Math.max(...similarityStats) : null;
+    const avgMissingCount = missingCountStats.length > 0
+      ? missingCountStats.reduce((a, b) => a + b, 0) / missingCountStats.length
+      : null;
+    const maxMissingCount = missingCountStats.length > 0 ? Math.max(...missingCountStats) : null;
+    
     await supabase.updateProcessJob(syncJob.id, {
       completed_at: now,
       urls_discovered: urlsDiscovered,
-      urls_updated: urlsUpdated, // Pages written to DB (status='processing')
+      urls_updated: urlsUpdated,
       urls_deleted: urlsDeleted,
       urls_errored: errors.length,
       firecrawl_batch_ids: firecrawlBatchIds,
       errors,
       status: 'completed',
+      metadata: {
+        // URL categorization breakdown
+        categorization: {
+          newUrls: newUrlsCount,
+          existingUrls: existingUrlsCount,
+          missingUrls: missingUrlsCount,
+        },
+        // Content change analysis
+        contentChanges: {
+          unchanged: unchangedUrlsCount,
+          changed: changedUrlsCount,
+          emptyContent: emptyContentCount,
+        },
+        // Similarity statistics (for pages that were compared)
+        similarity: {
+          average: avgSimilarity ? Number((avgSimilarity * 100).toFixed(2)) : null,
+          minimum: minSimilarity ? Number((minSimilarity * 100).toFixed(2)) : null,
+          maximum: maxSimilarity ? Number((maxSimilarity * 100).toFixed(2)) : null,
+          threshold: Number((config.sync.similarityThreshold * 100).toFixed(2)),
+          pagesCompared: similarityStats.length,
+        },
+        // Error tracking
+        errors: {
+          http404: error404Count,
+          http410: error410Count,
+          total: errors.length,
+        },
+        // Missing count statistics
+        missingCount: {
+          average: avgMissingCount ? Number(avgMissingCount.toFixed(2)) : null,
+          maximum: maxMissingCount ?? null,
+          pagesWithMissingCount: missingCountStats.length,
+          deletionThreshold: config.sync.deletionThreshold,
+        },
+        // Status changes summary
+        statusChanges: {
+          readyForIndexing: urlsUpdated - changedUrlsCount, // New pages
+          readyForReIndexing: changedUrlsCount, // Changed pages
+          readyForDeletion: urlsDeleted, // Pages past threshold
+        },
+      },
     });
 
     // Step 8: Update website

@@ -23,6 +23,7 @@
 
 import * as indexingService from '../packages/core/src/services/indexing.js';
 import * as supabase from '../packages/core/src/clients/supabase.js';
+import * as ingestionService from '../packages/core/src/services/ingestion.js';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -49,12 +50,12 @@ async function main() {
     if (!website) {
       console.error(`❌ Website not found: ${websiteId}`);
       console.log('\nAvailable websites:');
-      const websites = await supabase.listWebsites();
+      const websites = await ingestionService.listWebsites();
       if (websites.length === 0) {
         console.log('  (No websites found in database)');
       } else {
         websites.forEach(w => {
-          console.log(`  - ${w.id} (${w.domain}) ${w.display_name ? `- ${w.display_name}` : ''}`);
+          console.log(`  - ${w.id} (${w.domain}) ${w.displayName ? `- ${w.displayName}` : ''}`);
         });
       }
       process.exit(1);
@@ -63,20 +64,27 @@ async function main() {
     console.log(`✅ Website found: ${website.domain}${website.display_name ? ` (${website.display_name})` : ''}`);
     console.log(`   Store ID: ${website.gemini_store_id || '(none - will be created)'}\n`);
 
-    // Step 2: Check pages ready for indexing
-    console.log('Step 2: Checking pages ready for indexing...');
-    const pagesReady = await supabase.getPagesReadyForIndexing(websiteId, {
-      limit: 1000, // Check all pages
-    });
+    // Step 2: Check pages ready for processing (indexing, re-indexing, deletion)
+    console.log('Step 2: Checking pages ready for processing...');
+    const [pagesReadyForIndexing, pagesReadyForReIndexing, pagesReadyForDeletion] = await Promise.all([
+      supabase.getPagesReadyForIndexing(websiteId, { limit: 1000 }),
+      supabase.getPagesReadyForReIndexing(websiteId, { limit: 1000 }),
+      supabase.getPagesReadyForDeletion(websiteId, { limit: 1000 }),
+    ]);
 
-    console.log(`   Found ${pagesReady.length} pages ready for indexing`);
+    const totalPagesReady = pagesReadyForIndexing.length + pagesReadyForReIndexing.length + pagesReadyForDeletion.length;
     
-    if (pagesReady.length === 0) {
-      console.log('\n⚠️  No pages ready for indexing.');
-      console.log('\nPages need:');
-      console.log('  - status = "ready_for_indexing"');
-      console.log('  - markdown_content is not null/empty');
-      console.log('  - gemini_file_id is null (not already indexed)');
+    console.log(`   Found ${totalPagesReady} pages ready for processing:`);
+    console.log(`     - New pages (ready_for_indexing): ${pagesReadyForIndexing.length}`);
+    console.log(`     - Updated pages (ready_for_re_indexing): ${pagesReadyForReIndexing.length}`);
+    console.log(`     - Deletion pages (ready_for_deletion): ${pagesReadyForDeletion.length}`);
+    
+    if (totalPagesReady === 0) {
+      console.log('\n⚠️  No pages ready for processing.');
+      console.log('\nPages need one of these statuses:');
+      console.log('  - "ready_for_indexing" (new pages)');
+      console.log('  - "ready_for_re_indexing" (updated pages)');
+      console.log('  - "ready_for_deletion" (missing pages)');
       
       // Show page statuses
       const allPages = await supabase.getPagesByWebsite(websiteId);
@@ -94,11 +102,11 @@ async function main() {
         });
       }
       
-      console.log('\n💡 Tip: Run ingestion first to scrape and prepare pages for indexing.\n');
+      console.log('\n💡 Tip: Run ingestion or sync first to prepare pages for indexing.\n');
       process.exit(0);
     }
 
-    console.log(`   Pages with content: ${pagesReady.filter(p => p.markdown_content).length}\n`);
+    console.log(`   Total pages with content: ${pagesReadyForIndexing.length + pagesReadyForReIndexing.length}\n`);
 
     // Step 3: Run indexing
     console.log('Step 3: Running indexing service...\n');

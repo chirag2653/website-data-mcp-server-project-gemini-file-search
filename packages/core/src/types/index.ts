@@ -6,7 +6,7 @@
 // Database Types (matching Supabase schema)
 // ============================================================================
 
-export type PageStatus = 'pending' | 'ready_for_indexing' | 'processing' | 'active' | 'deleted' | 'redirect' | 'error';
+export type PageStatus = 'pending' | 'ready_for_indexing' | 'ready_for_re_indexing' | 'ready_for_deletion' | 'processing' | 'active' | 'deleted' | 'redirect' | 'error';
 export type SyncStatus = 'running' | 'completed' | 'failed';
 export type SyncType = 'full' | 'incremental' | 'manual';
 export type ProcessType = 'ingestion' | 'indexing' | 'sync' | 'manual_reindex';
@@ -385,6 +385,7 @@ export interface AppConfig {
   sync: {
     intervalHours: number;
     deletionThreshold: number;
+    similarityThreshold: number; // Minimum similarity (0-1) to consider content unchanged
   };
   logging: {
     level: string;

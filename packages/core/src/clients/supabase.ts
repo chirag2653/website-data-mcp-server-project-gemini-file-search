@@ -319,6 +319,93 @@ export async function getPagesReadyForIndexing(
   );
 }
 
+/**
+ * Get pages ready for re-indexing (content changed, need to delete old + upload new)
+ * 
+ * Criteria:
+ * - status = 'ready_for_re_indexing' (set by sync when content changed significantly)
+ * - markdown_content is not null (new content has been scraped)
+ * - gemini_file_id is not null (has existing document that needs to be deleted)
+ * 
+ * These are pages that already have a Gemini document but need to be re-indexed
+ * due to significant content changes.
+ */
+export async function getPagesReadyForReIndexing(
+  websiteId: string,
+  options?: {
+    processJobId?: string;
+    limit?: number;
+  }
+): Promise<Page[]> {
+  let query = supabase
+    .from('pages')
+    .select()
+    .eq('website_id', websiteId)
+    .eq('status', 'ready_for_re_indexing') // Pages marked as ready for re-indexing by sync
+    .not('markdown_content', 'is', null) // Must have new scraped content
+    .not('gemini_file_id', 'is', null) // Must have existing document to delete
+    .order('updated_at', { ascending: true }); // Oldest first (FIFO)
+
+  // Optional: Filter by process job (sync)
+  if (options?.processJobId) {
+    query = query.or(
+      `last_updated_by_sync_id.eq.${options.processJobId}`
+    );
+  }
+
+  if (options?.limit) {
+    query = query.limit(options.limit);
+  }
+
+  const { data, error } = await query;
+
+  if (error) {
+    throw new Error(`Failed to get pages ready for re-indexing: ${error.message}`);
+  }
+
+  // Additional filter: ensure markdown_content is not empty
+  return (data ?? []).filter(
+    (page) => page.markdown_content && page.markdown_content.trim().length > 0 && page.gemini_file_id
+  );
+}
+
+/**
+ * Get pages ready for deletion (missing for >= threshold, need to delete from Gemini)
+ * 
+ * Criteria:
+ * - status = 'ready_for_deletion' (set by sync when missing_count >= threshold)
+ * - gemini_file_id is not null (has document in Gemini that needs to be deleted)
+ * 
+ * These are pages that have been missing for consecutive syncs and need to be
+ * deleted from Gemini before being marked as 'deleted' in the database.
+ */
+export async function getPagesReadyForDeletion(
+  websiteId: string,
+  options?: {
+    limit?: number;
+  }
+): Promise<Page[]> {
+  let query = supabase
+    .from('pages')
+    .select()
+    .eq('website_id', websiteId)
+    .eq('status', 'ready_for_deletion') // Pages marked as ready for deletion by sync
+    .not('gemini_file_id', 'is', null) // Must have document in Gemini to delete
+    .order('updated_at', { ascending: true }); // Oldest first (FIFO)
+
+  if (options?.limit) {
+    query = query.limit(options.limit);
+  }
+
+  const { data, error } = await query;
+
+  if (error) {
+    throw new Error(`Failed to get pages ready for deletion: ${error.message}`);
+  }
+
+  return data ?? [];
+}
+
 export async function updatePage(id: string, data: PageUpdate): Promise<Page> {
   const { data: page, error } = await supabase
     .from('pages')
@@ -419,17 +506,24 @@ export async function getPagesPastDeletionThreshold(
   return data ?? [];
 }
 
-export async function markPagesDeleted(pageIds: string[]): Promise<void> {
+export async function updatePagesStatus(
+  pageIds: string[],
+  status: PageStatus
+): Promise<void> {
   if (pageIds.length === 0) return;
 
   const { error } = await supabase
     .from('pages')
-    .update({ status: 'deleted' })
+    .update({ status })
     .in('id', pageIds);
 
   if (error) {
-    throw new Error(`Failed to mark pages deleted: ${error.message}`);
+    throw new Error(`Failed to update pages status: ${error.message}`);
   }
+}
+
+export async function markPagesDeleted(pageIds: string[]): Promise<void> {
+  return updatePagesStatus(pageIds, 'deleted');
 }
 
 export async function deletePage(id: string): Promise<void> {

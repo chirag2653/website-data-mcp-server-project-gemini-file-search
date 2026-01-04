@@ -87,30 +87,85 @@ export async function indexWebsite(
       }
     }
 
-    // Step 2: Get pages ready for indexing
-    // These are pages that ingestion/sync has scraped and marked as "ready for indexing"
-    // Criteria: status='ready_for_indexing' + markdown_content exists + no gemini_file_id yet
+    // Step 2: Get pages ready for processing (indexing, re-indexing, and deletion)
+    // - New pages: status='ready_for_indexing' (no gemini_file_id)
+    // - Updated pages: status='ready_for_re_indexing' (has gemini_file_id, needs delete + upload)
+    // - Deletion pages: status='ready_for_deletion' (has gemini_file_id, needs delete only)
     // Optionally filter by process job (ingestion or sync)
     // Limit to 200 pages per run to manage memory and allow incremental progress
-    const pagesToIndex = await supabase.getPagesReadyForIndexing(websiteId, {
-      processJobId: parentJobId, // Use the parent job ID (sync or ingestion)
-      limit: 200, // Process 200 pages at a time
-    });
+    const [newPagesToIndex, reIndexPages, deletionPages] = await Promise.all([
+      supabase.getPagesReadyForIndexing(websiteId, {
+        processJobId: parentJobId,
+        limit: 200,
+      }),
+      supabase.getPagesReadyForReIndexing(websiteId, {
+        processJobId: parentJobId,
+        limit: 200,
+      }),
+      supabase.getPagesReadyForDeletion(websiteId, {
+        limit: 200,
+      }),
+    ]);
+
+    const pagesToIndex = [...newPagesToIndex, ...reIndexPages];
 
     log.info(
       { 
-        websiteId, 
-        pagesToIndex: pagesToIndex.length 
+        websiteId,
+        newPages: newPagesToIndex.length,
+        reIndexPages: reIndexPages.length,
+        deletionPages: deletionPages.length,
+        totalPages: pagesToIndex.length
       },
-      'Pages to index'
+      'Pages to process (new + re-index + deletion)'
     );
 
+    // Step 2a: Handle deletion pages first (delete from Gemini, then mark as deleted)
+    if (deletionPages.length > 0) {
+      log.info({ count: deletionPages.length }, 'Processing pages ready for deletion');
+      
+      for (const page of deletionPages) {
+        try {
+          // Delete document from Gemini
+          if (page.gemini_file_id) {
+            try {
+              await geminiHttp.deleteDocument(page.gemini_file_id);
+              log.debug({ pageId: page.id, url: page.url, fileId: page.gemini_file_id }, 'Deleted document from Gemini');
+            } catch (deleteError) {
+              const deleteMessage = deleteError instanceof Error ? deleteError.message : 'Unknown error';
+              const isNotFound = deleteMessage.includes('404') || deleteMessage.includes('not found') || deleteMessage.includes('NOT_FOUND');
+              
+              if (isNotFound) {
+                log.warn({ pageId: page.id, url: page.url }, 'Document not found in Gemini (already deleted)');
+              } else {
+                log.error({ pageId: page.id, url: page.url, error: deleteMessage }, 'Failed to delete document from Gemini');
+                errors.push({ url: page.url, error: `Failed to delete from Gemini: ${deleteMessage}`, timestamp: new Date().toISOString() });
+                continue; // Skip marking as deleted if deletion failed
+              }
+            }
+          }
+          
+          // Mark as deleted in database
+          await supabase.updatePagesStatus([page.id], 'deleted');
+          log.debug({ pageId: page.id, url: page.url }, 'Page marked as deleted');
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unknown error';
+          log.error({ pageId: page.id, url: page.url, error: message }, 'Failed to process deletion');
+          errors.push({ url: page.url, error: message, timestamp: new Date().toISOString() });
+        }
+      }
+      
+      log.info({ count: deletionPages.length }, 'Deletion pages processed');
+    }
+
     if (pagesToIndex.length === 0) {
-      log.info({ websiteId }, 'No pages to index');
+      log.info({ websiteId, deletionPagesProcessed: deletionPages.length, errors: errors.length }, 'No pages to index (deletions may have been processed)');
       
       await supabase.updateProcessJob(indexingJob.id, {
         status: 'completed',
         urls_updated: 0,
+        urls_errored: errors.length,
+        errors,
         completed_at: new Date().toISOString(),
       });
 
@@ -118,7 +173,7 @@ export async function indexWebsite(
         indexingJobId: indexingJob.id,
         websiteId,
         pagesIndexed: 0,
-        errors: [],
+        errors, // Include any errors from deletion processing
       };
     }
 
@@ -190,7 +245,65 @@ export async function indexWebsite(
       
       // Upload this batch of 5 in parallel
       const batchPromises = batch.map(async (item) => {
+        const page = pageMap.get(item.id);
+        if (!page) {
+          return {
+            id: item.id,
+            success: false,
+            error: 'Page not found in pageMap',
+          };
+        }
+
         try {
+          // For re-index pages, delete old document first and clear gemini_file_id in DB
+          if (page.status === 'ready_for_re_indexing' && page.gemini_file_id) {
+            const oldFileId = page.gemini_file_id;
+            log.info(
+              { pageId: page.id, url: page.url, oldFileId },
+              'Deleting old document before re-indexing'
+            );
+            
+            try {
+              // Step 1: Delete old document from Gemini using existing gemini_file_id
+              await geminiHttp.deleteDocument(oldFileId);
+              log.debug({ pageId: page.id, url: page.url, oldFileId }, 'Old document deleted from Gemini');
+              
+              // Step 2: Clear gemini_file_id in database immediately after successful deletion
+              // This ensures we don't have stale references and prevents duplicates
+              // If upload fails later, the page will be retried without the old file ID
+              await supabase.updatePage(page.id, {
+                gemini_file_id: undefined,
+                gemini_file_name: undefined,
+              });
+              log.debug({ pageId: page.id, url: page.url }, 'Cleared old gemini_file_id in database');
+            } catch (deleteError) {
+              // If delete fails, log but continue - document may already be gone
+              // However, we should still clear the DB reference to avoid stale data
+              const deleteMessage = deleteError instanceof Error ? deleteError.message : 'Unknown error';
+              const isNotFound = deleteMessage.includes('404') || deleteMessage.includes('not found') || deleteMessage.includes('NOT_FOUND');
+              
+              if (isNotFound) {
+                // Document already gone - clear DB reference
+                log.warn(
+                  { pageId: page.id, url: page.url, oldFileId, error: deleteMessage },
+                  'Old document not found (already deleted), clearing DB reference'
+                );
+                await supabase.updatePage(page.id, {
+                  gemini_file_id: undefined,
+                  gemini_file_name: undefined,
+                });
+              } else {
+                // Other error - log but continue with upload attempt
+                // We'll clear the reference after upload succeeds to avoid leaving stale data
+                log.warn(
+                  { pageId: page.id, url: page.url, oldFileId, error: deleteMessage },
+                  'Failed to delete old document, will clear reference after upload'
+                );
+              }
+            }
+          }
+
+          // Step 3: Upload new content (or first-time upload for new pages)
           const result = await geminiHttp.uploadToFileSearchStore(
             geminiStoreId,
             item.content,
@@ -212,6 +325,29 @@ export async function indexWebsite(
             await new Promise(resolve => setTimeout(resolve, geminiHttp.BATCH_CONFIG.RATE_LIMIT_BACKOFF_MS));
             
             try {
+              // For re-index pages, ensure old document is deleted before retry upload
+              // Note: gemini_file_id may already be cleared from first attempt, but if it's still there, delete it
+              if (page.status === 'ready_for_re_indexing' && page.gemini_file_id) {
+                const retryOldFileId = page.gemini_file_id;
+                try {
+                  await geminiHttp.deleteDocument(retryOldFileId);
+                  log.debug({ pageId: page.id, url: page.url, oldFileId: retryOldFileId }, 'Deleted old document before retry upload');
+                } catch (retryDeleteError) {
+                  // Ignore 404 - document may already be gone from first attempt
+                  const retryDeleteMessage = retryDeleteError instanceof Error ? retryDeleteError.message : 'Unknown error';
+                  const isNotFound = retryDeleteMessage.includes('404') || retryDeleteMessage.includes('not found') || retryDeleteMessage.includes('NOT_FOUND');
+                  if (!isNotFound) {
+                    log.warn({ pageId: page.id, url: page.url, oldFileId: retryOldFileId, error: retryDeleteMessage }, 'Failed to delete old document before retry');
+                  }
+                }
+                // Always clear DB reference before retry upload (idempotent - safe to call multiple times)
+                await supabase.updatePage(page.id, {
+                  gemini_file_id: undefined,
+                  gemini_file_name: undefined,
+                });
+                log.debug({ pageId: page.id, url: page.url }, 'Cleared gemini_file_id before retry upload');
+              }
+              
               const retryResult = await geminiHttp.uploadToFileSearchStore(
                 geminiStoreId,
                 item.content,
@@ -253,11 +389,12 @@ export async function indexWebsite(
           // According to API docs: https://ai.google.dev/api/file-search/documents#endpoint
           // States: STATE_PENDING (processing), STATE_ACTIVE (ready), STATE_FAILED (error)
           // We ONLY mark as 'active' when state is ACTIVE (completely done)
-          // PENDING → keep as 'ready_for_indexing' so it gets checked again (document is processing normally)
-          // FAILED → delete document and keep as 'ready_for_indexing' so it can be retried
+          // PENDING → keep original status so it gets checked again (document is processing normally)
+          // FAILED → delete document and keep original status so it can be retried
           // IMPORTANT: Only delete FAILED documents, NOT PENDING ones (PENDING is normal processing state)
+          const isReIndex = page.status === 'ready_for_re_indexing';
           let actualDocumentState: 'ACTIVE' | 'PROCESSING' | 'FAILED' = 'PROCESSING';
-          let finalStatus: 'active' | 'ready_for_indexing' = 'ready_for_indexing';
+          let finalStatus: 'active' | 'ready_for_indexing' | 'ready_for_re_indexing' = isReIndex ? 'ready_for_re_indexing' : 'ready_for_indexing';
           let shouldDeleteDocument = false;
           
           // Add a small delay before checking document state to avoid race conditions
@@ -279,15 +416,15 @@ export async function indexWebsite(
             } else if (geminiState === 'FAILED' || geminiState === 'STATE_FAILED') {
               // Document processing failed - delete it and retry
               actualDocumentState = 'FAILED';
-              finalStatus = 'ready_for_indexing'; // Back to ready for indexing so it can be retried
+              finalStatus = isReIndex ? 'ready_for_re_indexing' : 'ready_for_indexing'; // Keep original status for retry
               shouldDeleteDocument = true; // Delete failed document to avoid duplication
             } else {
               // PENDING, STATE_PENDING, or unknown - still processing embeddings
               // PENDING is a normal state - document is being processed by Gemini
               // DO NOT delete - it will become ACTIVE once embeddings are generated
-              // Keep status as 'ready_for_indexing' so it can be checked again in next run
+              // Keep original status so it can be checked again in next run
               actualDocumentState = 'PROCESSING';
-              finalStatus = 'ready_for_indexing'; // Back to ready for indexing so it can be checked again
+              finalStatus = isReIndex ? 'ready_for_re_indexing' : 'ready_for_indexing'; // Keep original status
               shouldDeleteDocument = false; // DO NOT delete PENDING documents - they're processing normally
             }
           } catch (docError) {
@@ -304,7 +441,7 @@ export async function indexWebsite(
                 'Document not found yet (may still be initializing), will check again in next run'
               );
               actualDocumentState = 'PROCESSING';
-              finalStatus = 'ready_for_indexing';
+              finalStatus = isReIndex ? 'ready_for_re_indexing' : 'ready_for_indexing';
               shouldDeleteDocument = false; // Don't delete - document might still be initializing
             } else {
               // Other error - can't verify state, be conservative
@@ -313,7 +450,7 @@ export async function indexWebsite(
                 'Could not verify document state, will retry next run'
               );
               actualDocumentState = 'PROCESSING';
-              finalStatus = 'ready_for_indexing';
+              finalStatus = isReIndex ? 'ready_for_re_indexing' : 'ready_for_indexing';
               shouldDeleteDocument = false; // Don't delete - might be a temporary API issue
             }
           }
@@ -396,18 +533,19 @@ export async function indexWebsite(
             }
           }
       } else {
-        // Upload failed - keep status='ready_for_indexing' so it can be retried
+        // Upload failed - keep original status so it can be retried
         const errorMessage = result.error || 'Unknown upload error';
-        log.error({ url: page.url, error: errorMessage }, 'Failed to upload page to Gemini');
+        const isReIndex = page.status === 'ready_for_re_indexing';
+        log.error({ url: page.url, error: errorMessage, isReIndex }, 'Failed to upload page to Gemini');
         errors.push({ url: page.url, error: errorMessage, timestamp: now });
 
-        // Keep status as 'ready_for_indexing' so it gets picked up in next indexing run
+        // Keep original status ('ready_for_indexing' or 'ready_for_re_indexing') so it gets picked up in next indexing run
         // Clear any stale gemini_file_id to ensure page can be retried
         await supabase.updatePage(page.id, {
+          status: isReIndex ? 'ready_for_re_indexing' : 'ready_for_indexing', // Preserve original status
           error_message: errorMessage,
           gemini_file_id: undefined, // Clear stale file ID so page can be retried
           gemini_file_name: undefined, // Clear stale file name
-          // Status remains 'ready_for_indexing' - will be retried
         });
       }
       }

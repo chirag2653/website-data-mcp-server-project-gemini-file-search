@@ -7,13 +7,13 @@
  * This helps you find website IDs for testing indexing
  */
 
-import * as supabase from '../packages/core/src/clients/supabase.js';
+import * as ingestionService from '../packages/core/src/services/ingestion.js';
 
 async function main() {
   console.log('\n📋 Listing Websites\n');
 
   try {
-    const websites = await supabase.listWebsites();
+    const websites = await ingestionService.listWebsites();
 
     if (websites.length === 0) {
       console.log('No websites found in database.\n');
@@ -29,11 +29,13 @@ async function main() {
     websites.forEach((website, index) => {
       console.log(`${index + 1}. Website ID: ${website.id}`);
       console.log(`   Domain: ${website.domain}`);
-      if (website.display_name) {
-        console.log(`   Display Name: ${website.display_name}`);
+      if (website.displayName) {
+        console.log(`   Display Name: ${website.displayName}`);
       }
-      console.log(`   Store ID: ${website.gemini_store_id || '(none)'}`);
-      console.log(`   Created: ${website.created_at}`);
+      console.log(`   Pages: ${website.pageCount}`);
+      if (website.lastCrawl) {
+        console.log(`   Last Crawl: ${website.lastCrawl}`);
+      }
       console.log('');
     });
 
